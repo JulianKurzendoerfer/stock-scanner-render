@@ -1,93 +1,70 @@
-import os, time, json
-from datetime import datetime, timedelta, timezone
+import os,time
+from datetime import datetime,timedelta,timezone
+import requests,pandas as pd,pandas_ta as ta,pandas_market_calendars as mcal
+from fastapi import FastAPI,Query
 
-import requests
-import pandas as pd
-import pandas_ta as ta
-import pandas_market_calendars as mcal
-import redis
-from fastapi import FastAPI, Query
+EODHD_KEY=os.environ["EODHD_API_KEY"]
+WATCHLIST_PATH="watchlist.txt"
+BASE="https://eodhd.com/api"
+CACHE={}
+app=FastAPI()
 
-EODHD_KEY = os.environ["EODHD_API_KEY"]
-REDIS_URL = os.environ["REDIS_URL"]
-WATCHLIST_PATH = "watchlist.txt"
-
-rdb = redis.from_url(REDIS_URL, decode_responses=True)
-app = FastAPI()
-
-EODHD_BASE = "https://eodhd.com/api"
-
-def load_watchlist():
+def wl():
     with open(WATCHLIST_PATH) as f:
         return [l.strip() for l in f if l.strip()]
 
-def nyse_times():
-    cal = mcal.get_calendar("XNYS")
-    today = datetime.now(timezone.utc).date()
-    sched = cal.schedule(start_date=today, end_date=today)
-    if sched.empty:
-        return {"isTradingDay": False}
+def times():
+    cal=mcal.get_calendar("XNYS")
+    d=datetime.now(timezone.utc).date()
+    s=cal.schedule(d,d)
+    if s.empty:return {"isTradingDay":False}
+    o=s.iloc[0]["market_open"].to_pydatetime().astimezone(timezone.utc)
+    return {"isTradingDay":True,"open":o.isoformat(),"run1":(o+timedelta(minutes=30)).isoformat(),"run2":(o+timedelta(hours=3,minutes=30)).isoformat()}
 
-    open_ = sched.iloc[0]["market_open"].to_pydatetime()
-    t1 = open_ + timedelta(minutes=30)
-    t2 = open_ + timedelta(hours=3, minutes=30)
+def get(k):
+    v=CACHE.get(k)
+    if not v:return None
+    e,d=v
+    if time.time()>e:
+        CACHE.pop(k,None)
+        return None
+    return d
 
-    return {
-        "isTradingDay": True,
-        "t1_utc": t1.isoformat(),
-        "t2_utc": t2.isoformat()
-    }
+def setc(k,d,t):
+    CACHE[k]=(time.time()+t,d)
 
-def intraday(symbol):
-    now = int(time.time())
-    key = f"{symbol}:{now//300}"
-    cached = rdb.get(key)
-    if cached:
-        data = json.loads(cached)
-    else:
-        url = f"{EODHD_BASE}/intraday/{symbol}"
-        r = requests.get(url, params={
-            "api_token": EODHD_KEY,
-            "interval": "5m",
-            "fmt": "json"
-        })
-        data = r.json()
-        rdb.setex(key, 240, json.dumps(data))
+def data(sym):
+    k=f"{sym}:{int(time.time())//300}"
+    d=get(k)
+    if d is None:
+        r=requests.get(f"{BASE}/intraday/{sym}",params={"api_token":EODHD_KEY,"interval":"5m","fmt":"json"},timeout=20)
+        r.raise_for_status()
+        d=r.json()
+        setc(k,d,240)
+    df=pd.DataFrame(d)
+    if df.empty:return df
+    df["datetime"]=pd.to_datetime(df["datetime"],utc=True)
+    return df.sort_values("datetime").tail(200).reset_index(drop=True)
 
-    df = pd.DataFrame(data)
-    if df.empty:
-        return df
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    return df.tail(200)
-
-def signal(df):
-    close = df["close"]
-    rsi = ta.rsi(close, 14)
-    macd = ta.macd(close)
-
-    if rsi.iloc[-1] < 30 and macd["MACDh_12_26_9"].iloc[-1] > macd["MACDh_12_26_9"].iloc[-2]:
-        return "BUY"
-    if rsi.iloc[-1] > 70 and macd["MACDh_12_26_9"].iloc[-1] < macd["MACDh_12_26_9"].iloc[-2]:
-        return "SELL"
+def sig(df):
+    if len(df)<60:return None
+    c=df["close"]
+    rsi=ta.rsi(c,14)
+    macd=ta.macd(c)
+    if rsi.iloc[-1]<30 and macd["MACDh_12_26_9"].iloc[-1]>0:return "BUY"
+    if rsi.iloc[-1]>70 and macd["MACDh_12_26_9"].iloc[-1]<0:return "SELL"
     return None
 
 @app.get("/times")
-def times():
-    return nyse_times()
+def t():return times()
 
-@app.post("/scan")
-def scan(run: int = Query(...)):
-    buys, sells = [], []
-    for s in load_watchlist():
+@app.get("/scan")
+def scan():
+    res=[]
+    for s in wl():
         try:
-            df = intraday(s)
-            sig = signal(df)
-            if sig == "BUY":
-                buys.append(s)
-            elif sig == "SELL":
-                sells.append(s)
-        except:
-            pass
-
-    text = f"RUN {run}\nBUY: {buys}\nSELL: {sells}"
-    return {"text": text}
+            df=data(s)
+            sg=sig(df)
+            if sg:res.append({"symbol":s,"signal":sg})
+        except:pass
+    return {"signals":res}
