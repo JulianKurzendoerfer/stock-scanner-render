@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+requests
+pandas
+numpy
+pandas-ta
+pandas-market-calendars
+redis
