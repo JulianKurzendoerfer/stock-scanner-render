@@ -4,3 +4,4 @@ requests
 pandas
 pandas-ta
 pandas-market-calendars
+yfinance
