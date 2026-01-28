@@ -9,9 +9,12 @@ BASE="https://eodhd.com/api"
 CACHE={}
 app=FastAPI()
 
+def norm(sym):
+    return sym if "." in sym else f"{sym}.US"
+
 def wl():
     with open(WATCHLIST_PATH,"r",encoding="utf-8") as f:
-        return [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        return [norm(l.strip()) for l in f if l.strip() and not l.strip().startswith("#")]
 
 def times():
     cal=mcal.get_calendar("XNYS")
