@@ -47,15 +47,16 @@ def intraday(sym,interval="5m"):
         cset(k,d,240)
     df=pd.DataFrame(d)
     if df.empty:return df
-    df["datetime"]=pd.to_datetime(df["datetime"],utc=True)
-    return df.sort_values("datetime").tail(260).reset_index(drop=True)
+    df["datetime"]=pd.to_datetime(df["datetime"],utc=True,errors="coerce")
+    df=df.dropna(subset=["datetime"]).sort_values("datetime").tail(260).reset_index(drop=True)
+    return df
 
-def rsi_ok(close):
+def rsi_eval(close):
     rsi=ta.rsi(close,14)
-    if rsi is None or rsi.isna().all():return (False,None,None)
+    if rsi is None or rsi.isna().all(): return (False,None,None,None)
     now=float(rsi.iloc[-1]); prev=float(rsi.iloc[-2])
-    ok=(prev<30 and now>=30) or (now>=28.7 and now-prev>=2.0)
-    return (ok,now,prev)
+    weak=(prev<30 and now>=30) or (now>=28.7 and now-prev>=2.0) or (now<30)
+    return (weak,now,prev,float(now-prev))
 
 def stoch_ok(high,low,close):
     st=ta.stoch(high,low,close,14,3,3)
@@ -93,19 +94,18 @@ def sig(df,sym):
     close=df["close"]; high=df["high"]; low=df["low"]
     price=float(close.iloc[-1])
 
-    rok,rnow,rprev=rsi_ok(close)
-    if not rok:return None
+    r_ok,r_now,r_prev,r_d=rsi_eval(close)
+    if not r_ok:return None
 
-    sok,sjump=stoch_ok(high,low,close)
-    mok,h3,h2,h1=macd_ok(close)
-    bok,bdist=bb_ok(close)
+    s_ok,s_jump=stoch_ok(high,low,close)
+    m_ok,h3,h2,h1=macd_ok(close)
+    b_ok,b_dist=bb_ok(close)
 
-    strong = sok and mok and bok
-    level = "BUY_STRONG" if strong else "BUY_WEAK"
+    level="BUY_STRONG" if (s_ok and m_ok and b_ok) else "BUY_WEAK"
 
-    out={"symbol":sym,"signal":level,"price":round(price,4),"rsi":round(float(rnow),2)}
-    if bdist is not None: out["bb_distance_pct"]=round(float(bdist),2)
-    if sjump is not None: out["stoch_jump"]=round(float(sjump),2)
+    out={"symbol":sym,"signal":level,"price":round(price,4),"rsi":round(float(r_now),2),"rsi_delta":round(float(r_d),2)}
+    if b_dist is not None: out["bb_distance_pct"]=round(float(b_dist),2)
+    if s_jump is not None: out["stoch_jump"]=round(float(s_jump),2)
     if h1 is not None: out["macdh"]=[round(float(h3),5),round(float(h2),5),round(float(h1),5)]
     return out
 
@@ -124,3 +124,49 @@ def scan():
         except:
             pass
     return {"signals":out}
+
+@app.get("/scan_debug")
+def scan_debug():
+    syms=wl()
+    total=len(syms)
+    ok_df=0
+    short_df=0
+    rsi_ok_ct=0
+    strong_ct=0
+    errs=0
+    lowest=[]
+    for s in syms:
+        try:
+            df=intraday(s,"5m")
+            if df is None or df.empty:
+                errs+=1
+                continue
+            if len(df)<60:
+                short_df+=1
+                continue
+            ok_df+=1
+            close=df["close"]
+            r_ok,r_now,r_prev,r_d=rsi_eval(close)
+            if r_now is not None:
+                lowest.append((float(r_now),s,round(float(close.iloc[-1]),4),round(float(r_d),2)))
+            if not r_ok:
+                continue
+            rsi_ok_ct+=1
+            high=df["high"]; low=df["low"]
+            s_ok,_=stoch_ok(high,low,close)
+            m_ok,_,_,_=macd_ok(close)
+            b_ok,_=bb_ok(close)
+            if s_ok and m_ok and b_ok:
+                strong_ct+=1
+        except:
+            errs+=1
+    lowest_sorted=sorted(lowest, key=lambda x: x[0])[:15]
+    return {
+        "total": total,
+        "ok_df_len_ge_60": ok_df,
+        "too_short_len_lt_60": short_df,
+        "errors_or_empty": errs,
+        "rsi_weak_count": rsi_ok_ct,
+        "strong_count": strong_ct,
+        "lowest_rsi_15": [{"rsi":x[0],"symbol":x[1],"price":x[2],"rsi_delta":x[3]} for x in lowest_sorted]
+    }
