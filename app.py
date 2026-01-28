@@ -1,62 +1,38 @@
 import os
-import json
 import math
-import time
-from typing import Any, Dict, List, Optional, Tuple
-
+import datetime as dt
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
-import pandas_ta as ta
-import pandas_market_calendars as mcal
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+import pandas_market_calendars as mcal
 
-APP_TZ = "Europe/Berlin"
-CAL = mcal.get_calendar("XNYS")
-
-EODHD_API_KEY = os.getenv("EODHD_API_KEY", "")
-
-WATCHLIST_PATH = os.getenv("WATCHLIST_PATH", "watchlist.txt")
-TIMEFRAME = os.getenv("TIMEFRAME", "1d")
-HISTORY_PERIOD = os.getenv("HISTORY_PERIOD", "6mo")
+APP_TZ = dt.timezone.utc
+NYSE_TZ = dt.timezone(dt.timedelta(hours=-5))
 
 RSI_LEN = int(os.getenv("RSI_LEN", "14"))
 BB_LEN = int(os.getenv("BB_LEN", "20"))
 BB_STD = float(os.getenv("BB_STD", "2"))
-STOCH_K = int(os.getenv("STOCH_K", "14"))
-STOCH_D = int(os.getenv("STOCH_D", "3"))
 MACD_FAST = int(os.getenv("MACD_FAST", "12"))
 MACD_SLOW = int(os.getenv("MACD_SLOW", "26"))
 MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", "9"))
+STOCH_K = int(os.getenv("STOCH_K", "14"))
+STOCH_D = int(os.getenv("STOCH_D", "3"))
+RSI_TRIGGER = float(os.getenv("RSI_TRIGGER", "30"))
+INTERVAL = os.getenv("INTERVAL", "1d")
+PERIOD = os.getenv("PERIOD", "6mo")
 
-RSI_WEAK_MAX = float(os.getenv("RSI_WEAK_MAX", "30"))
-RSI_WEAK_NEAR = float(os.getenv("RSI_WEAK_NEAR", "29"))
-RSI_DELTA_MIN = float(os.getenv("RSI_DELTA_MIN", "0.6"))
-
-BB_MAX_PCT_FROM_LOWER = float(os.getenv("BB_MAX_PCT_FROM_LOWER", "35"))
-
-STOCH_RISE_MIN = float(os.getenv("STOCH_RISE_MIN", "8"))
-STOCH_LOW_TH = float(os.getenv("STOCH_LOW_TH", "20"))
-
-MACD_HIST_NEED_BARS = int(os.getenv("MACD_HIST_NEED_BARS", "2"))
+EODHD_TOKEN = os.getenv("EODHD_TOKEN", "").strip()
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-def read_watchlist() -> List[str]:
-    if not os.path.exists(WATCHLIST_PATH):
+def _read_watchlist():
+    path = os.path.join(os.path.dirname(__file__), "watchlist.txt")
+    if not os.path.exists(path):
         return []
-    out: List[str] = []
-    with open(WATCHLIST_PATH, "r", encoding="utf-8") as f:
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             s = line.strip()
             if not s or s.startswith("#"):
@@ -64,281 +40,248 @@ def read_watchlist() -> List[str]:
             out.append(s)
     return out
 
-def now_utc() -> pd.Timestamp:
-    return pd.Timestamp.utcnow()
+def _safe_float(x):
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (float, int, np.floating, np.integer)):
+            if math.isnan(float(x)):
+                return None
+            return float(x)
+        v = float(x)
+        if math.isnan(v):
+            return None
+        return v
+    except Exception:
+        return None
 
-def nyse_next_times() -> Dict[str, Any]:
-    now = pd.Timestamp.now(tz=APP_TZ)
-    start = (now - pd.Timedelta(days=2)).date()
-    end = (now + pd.Timedelta(days=7)).date()
-    sched = CAL.schedule(start_date=start, end_date=end)
-    if sched.empty:
-        return {"isTradingDay": False, "open": None, "run1": None, "run2": None}
-    local = sched.tz_convert(APP_TZ)
-    today = now.date()
-    day = local[local.index.date == today]
-    if day.empty:
-        nxt = local.iloc[0]
-        market_open = nxt["market_open"]
+def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+    avg_loss = loss.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def _bbands(close: pd.Series, n: int = 20, k: float = 2.0):
+    ma = close.rolling(n, min_periods=n).mean()
+    sd = close.rolling(n, min_periods=n).std(ddof=0)
+    upper = ma + k * sd
+    lower = ma - k * sd
+    return ma, upper, lower
+
+def _macd(close: pd.Series, fast: int = 12, slow: int = 26, sig: int = 9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    signal = macd.ewm(span=sig, adjust=False).mean()
+    hist = macd - signal
+    return macd, signal, hist
+
+def _stoch(high: pd.Series, low: pd.Series, close: pd.Series, k: int = 14, d: int = 3):
+    ll = low.rolling(k, min_periods=k).min()
+    hh = high.rolling(k, min_periods=k).max()
+    denom = (hh - ll).replace(0, np.nan)
+    k_line = 100 * (close - ll) / denom
+    d_line = k_line.rolling(d, min_periods=d).mean()
+    return k_line, d_line
+
+def _fetch_yfinance(symbol: str) -> pd.DataFrame:
+    df = yf.download(
+        symbol,
+        interval=INTERVAL,
+        period=PERIOD,
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+        group_by="column",
+    )
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.rename(columns=lambda c: str(c).strip().title())
+    for c in ["Open", "High", "Low", "Close"]:
+        if c not in df.columns:
+            return pd.DataFrame()
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    return df
+
+def _fetch_eodhd(symbol: str) -> pd.DataFrame:
+    if not EODHD_TOKEN:
+        return pd.DataFrame()
+    s = symbol
+    if "." not in s:
+        s = f"{s}.US"
+    url = f"https://eodhd.com/api/eod/{s}"
+    params = {"api_token": EODHD_TOKEN, "fmt": "json", "period": "d"}
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        data = r.json()
+        if not isinstance(data, list) or len(data) == 0:
+            return pd.DataFrame()
+        df = pd.DataFrame(data)
+        for col in ["open", "high", "low", "close", "date"]:
+            if col not in df.columns:
+                return pd.DataFrame()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        df = df.set_index("date").sort_index()
+        df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
+        df = df[["Open", "High", "Low", "Close"]].dropna()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def _compute_indicators(df: pd.DataFrame) -> dict:
+    close = df["Close"].astype(float)
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+
+    rsi = _rsi(close, RSI_LEN)
+    bb_mid, bb_up, bb_low = _bbands(close, BB_LEN, BB_STD)
+    macd, macd_sig, macd_hist = _macd(close, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    stoch_k, stoch_d = _stoch(high, low, close, STOCH_K, STOCH_D)
+
+    last = df.iloc[-1]
+    out = {
+        "price": _safe_float(last["Close"]),
+        "rsi": _safe_float(rsi.iloc[-1]) if len(rsi) else None,
+        "bb_mid": _safe_float(bb_mid.iloc[-1]) if len(bb_mid) else None,
+        "bb_upper": _safe_float(bb_up.iloc[-1]) if len(bb_up) else None,
+        "bb_lower": _safe_float(bb_low.iloc[-1]) if len(bb_low) else None,
+        "macd": _safe_float(macd.iloc[-1]) if len(macd) else None,
+        "macd_signal": _safe_float(macd_sig.iloc[-1]) if len(macd_sig) else None,
+        "macd_hist": _safe_float(macd_hist.iloc[-1]) if len(macd_hist) else None,
+        "stoch_k": _safe_float(stoch_k.iloc[-1]) if len(stoch_k) else None,
+        "stoch_d": _safe_float(stoch_d.iloc[-1]) if len(stoch_d) else None,
+    }
+    if out["bb_lower"] is not None and out["price"] is not None and out["bb_lower"] != 0:
+        out["bb_dist_pct"] = _safe_float((out["price"] - out["bb_lower"]) / out["bb_lower"] * 100.0)
     else:
-        market_open = day.iloc[0]["market_open"]
-    open_time = market_open.tz_convert("UTC")
-    run1 = (market_open + pd.Timedelta(minutes=30)).tz_convert("UTC")
-    run2 = (market_open + pd.Timedelta(hours=3, minutes=30)).tz_convert("UTC")
+        out["bb_dist_pct"] = None
+    return out
+
+def _rsi_signal(ind: dict) -> str | None:
+    rsi = ind.get("rsi")
+    if rsi is None:
+        return None
+    if rsi <= RSI_TRIGGER:
+        return "WEAK_BUY"
+    return None
+
+@app.get("/")
+def root():
+    return {"ok": True, "endpoints": ["/times", "/scan", "/scan_debug"]}
+
+@app.get("/times")
+def times():
+    nyse = mcal.get_calendar("NYSE")
+    now_utc = dt.datetime.now(tz=APP_TZ)
+    today = now_utc.date()
+    schedule = nyse.schedule(start_date=today, end_date=today)
+    if schedule.empty:
+        return {"isTradingDay": False, "open": None, "run1": None, "run2": None}
+    open_ts = schedule.iloc[0]["market_open"].to_pydatetime().replace(tzinfo=APP_TZ)
+    run1 = open_ts + dt.timedelta(minutes=30)
+    run2 = open_ts + dt.timedelta(minutes=210)
     return {
         "isTradingDay": True,
-        "open": open_time.isoformat(),
+        "open": open_ts.isoformat(),
         "run1": run1.isoformat(),
         "run2": run2.isoformat(),
     }
 
-def _yf_download(symbol: str) -> Optional[pd.DataFrame]:
-    try:
-        df = yf.download(
-            symbol,
-            period=HISTORY_PERIOD,
-            interval=TIMEFRAME,
-            auto_adjust=False,
-            progress=False,
-            threads=True,
-        )
-        if df is None or df.empty:
-            return None
-        df = df.rename(columns={c: c.lower() for c in df.columns})
-        if "close" not in df.columns:
-            return None
-        df = df.reset_index()
-        if "Date" in df.columns:
-            df = df.rename(columns={"Date": "datetime"})
-        elif "Datetime" in df.columns:
-            df = df.rename(columns={"Datetime": "datetime"})
-        if "datetime" not in df.columns:
-            return None
-        df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
-        df = df.dropna(subset=["datetime"])
-        df = df.sort_values("datetime").reset_index(drop=True)
-        return df
-    except Exception:
-        return None
-
-def _eodhd_download(symbol: str) -> Optional[pd.DataFrame]:
-    if not EODHD_API_KEY:
-        return None
-    try:
-        sym = symbol
-        if "." not in sym:
-            sym = f"{sym}.US"
-        url = f"https://eodhd.com/api/eod/{sym}"
-        params = {
-            "api_token": EODHD_API_KEY,
-            "fmt": "json",
-            "period": "d",
-            "from": (pd.Timestamp.utcnow() - pd.Timedelta(days=365)).date().isoformat(),
-            "to": pd.Timestamp.utcnow().date().isoformat(),
-        }
-        r = requests.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, list) or len(data) == 0:
-            return None
-        df = pd.DataFrame(data)
-        need = {"date", "close", "open", "high", "low", "volume"}
-        if not need.issubset(set(df.columns)):
-            return None
-        df = df.rename(columns={"date": "datetime"})
-        df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
-        df = df.dropna(subset=["datetime"])
-        df = df.sort_values("datetime").reset_index(drop=True)
-        for c in ["open", "high", "low", "close", "volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=["close"])
-        return df
-    except Exception:
-        return None
-
-def get_data(symbol: str) -> Tuple[Optional[pd.DataFrame], str, Optional[str]]:
-    df = _yf_download(symbol)
-    if df is not None and len(df) >= 60:
-        return df, "yfinance", None
-    df2 = _eodhd_download(symbol)
-    if df2 is not None and len(df2) >= 60:
-        return df2, "eodhd", None
-    if df is not None and not df.empty:
-        return df, "yfinance", "short_history"
-    return None, "none", "no_data"
-
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    o = df.copy()
-    o["rsi"] = ta.rsi(o["close"], length=RSI_LEN)
-    bb = ta.bbands(o["close"], length=BB_LEN, std=BB_STD)
-    if bb is not None and not bb.empty:
-        cols = {c.lower(): c for c in bb.columns}
-        lcol = cols.get(f"bbl_{BB_LEN}_{BB_STD}".lower())
-        mcol = cols.get(f"bbm_{BB_LEN}_{BB_STD}".lower())
-        ucol = cols.get(f"bbu_{BB_LEN}_{BB_STD}".lower())
-        if lcol:
-            o["bb_lower"] = bb[lcol].values
-        if mcol:
-            o["bb_mid"] = bb[mcol].values
-        if ucol:
-            o["bb_upper"] = bb[ucol].values
-    macd = ta.macd(o["close"], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
-    if macd is not None and not macd.empty:
-        cols = {c.lower(): c for c in macd.columns}
-        hcol = cols.get(f"macdh_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}".lower())
-        if hcol:
-            o["macd_hist"] = macd[hcol].values
-    st = ta.stoch(o["high"], o["low"], o["close"], k=STOCH_K, d=STOCH_D)
-    if st is not None and not st.empty:
-        cols = {c.lower(): c for c in st.columns}
-        kcol = cols.get(f"stochk_{STOCH_K}_{STOCH_D}_{STOCH_D}".lower())
-        dcol = cols.get(f"stochd_{STOCH_K}_{STOCH_D}_{STOCH_D}".lower())
-        if kcol:
-            o["stoch_k"] = st[kcol].values
-        if dcol:
-            o["stoch_d"] = st[dcol].values
-    return o
-
-def pct_from_lower_bb(close: float, bb_lower: float) -> Optional[float]:
-    if bb_lower is None or not np.isfinite(bb_lower) or bb_lower == 0:
-        return None
-    return float((close - bb_lower) / abs(bb_lower) * 100.0)
-
-def macd_improving(hist: pd.Series, n: int) -> bool:
-    h = hist.dropna()
-    if len(h) < n + 1:
-        return False
-    last = h.iloc[-(n+1):].values
-    diffs = np.diff(last)
-    return bool(np.all(diffs > 0))
-
-def stoch_impulse(k: pd.Series) -> Tuple[bool, Optional[float]]:
-    s = k.dropna()
-    if len(s) < 3:
-        return (False, None)
-    k0 = float(s.iloc[-1])
-    k1 = float(s.iloc[-2])
-    delta = k0 - k1
-    cond1 = (k1 <= STOCH_LOW_TH and delta >= STOCH_RISE_MIN)
-    cond2 = (delta >= STOCH_RISE_MIN * 1.2)
-    return (bool(cond1 or cond2), float(delta))
-
-def rsi_weak(rsi: pd.Series) -> Tuple[bool, Optional[float], Optional[float]]:
-    s = rsi.dropna()
-    if len(s) < 3:
-        return (False, None, None)
-    r0 = float(s.iloc[-1])
-    r1 = float(s.iloc[-2])
-    delta = r0 - r1
-    near = (r0 <= RSI_WEAK_MAX) or (r1 <= RSI_WEAK_NEAR and delta >= RSI_DELTA_MIN)
-    return (bool(near), r0, float(delta))
-
-def analyze_symbol(symbol: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    df, source, err = get_data(symbol)
-    meta = {"symbol": symbol, "source": source, "error": err}
-    if df is None or df.empty:
-        return [], meta
-    if len(df) < 60:
-        meta["error"] = "too_short"
-        return [], meta
-
-    dfi = compute_indicators(df)
-    last = dfi.iloc[-1]
-    close = float(last["close"]) if np.isfinite(last.get("close", np.nan)) else None
-    if close is None:
-        meta["error"] = "no_close"
-        return [], meta
-
-    weak_ok, rsi_val, rsi_delta = rsi_weak(dfi["rsi"])
-    if not weak_ok or rsi_val is None:
-        return [], meta
-
-    strong_parts: List[str] = []
-    bb_dist = None
-    if "bb_lower" in dfi.columns:
-        bb_dist = pct_from_lower_bb(close, float(last.get("bb_lower", np.nan)))
-        if bb_dist is not None and bb_dist <= BB_MAX_PCT_FROM_LOWER:
-            strong_parts.append("BB_OK")
-
-    macd_ok = False
-    if "macd_hist" in dfi.columns:
-        macd_ok = macd_improving(dfi["macd_hist"], MACD_HIST_NEED_BARS)
-        if macd_ok:
-            strong_parts.append("MACD_OK")
-
-    stoch_ok, stoch_delta = (False, None)
-    if "stoch_k" in dfi.columns:
-        stoch_ok, stoch_delta = stoch_impulse(dfi["stoch_k"])
-        if stoch_ok:
-            strong_parts.append("STOCH_OK")
-
-    strong_ok = (len(strong_parts) >= 2)
-
-    sig_type = "STRONG_BUY" if strong_ok else "WEAK_BUY"
-    reason = []
-    reason.append(f"RSI_OK rsi={round(rsi_val,2)} delta={round(rsi_delta or 0.0,2)}")
-    if bb_dist is not None:
-        reason.append(f"BB_DIST {round(bb_dist,2)}%")
-    if stoch_delta is not None:
-        reason.append(f"STOCH_DELTA {round(stoch_delta,2)}")
-    if strong_parts:
-        reason.append("STRONG_PARTS " + ",".join(strong_parts))
-    else:
-        reason.append("STRONG_PARTS none")
-
-    out = [{
-        "symbol": symbol,
-        "source": source,
-        "price": round(close, 4),
-        "rsi": round(float(rsi_val), 2),
-        "rsi_delta": round(float(rsi_delta or 0.0), 2),
-        "bb_distance": None if bb_dist is None else round(float(bb_dist), 2),
-        "type": sig_type,
-        "reason": " | ".join(reason),
-    }]
-    return out, meta
-
-@app.get("/")
-def root():
-    return {"ok": True}
-
-@app.get("/times")
-def times():
-    return nyse_next_times()
-
 @app.get("/scan")
 def scan():
-    wl = read_watchlist()
-    signals: List[Dict[str, Any]] = []
-    errors: List[Dict[str, Any]] = []
+    watch = _read_watchlist()
+    signals = []
+    errors = []
+    for sym in watch:
+        df = _fetch_yfinance(sym)
+        source = "yfinance"
+        if df.empty:
+            df = _fetch_eodhd(sym)
+            source = "eodhd" if not df.empty else "none"
+        if df.empty or len(df) < max(RSI_LEN + 2, BB_LEN + 2, STOCH_K + 2, MACD_SLOW + 2):
+            errors.append({"symbol": sym, "source": source, "error": "no_data_or_too_short"})
+            continue
+        ind = _compute_indicators(df)
+        sig_type = _rsi_signal(ind)
+        if sig_type:
+            payload = {
+                "symbol": sym,
+                "source": source,
+                "type": sig_type,
+                "price": None if ind["price"] is None else round(ind["price"], 2),
+                "rsi": None if ind["rsi"] is None else round(ind["rsi"], 2),
+                "bb_dist_pct": None if ind["bb_dist_pct"] is None else round(ind["bb_dist_pct"], 2),
+                "bb_lower": None if ind["bb_lower"] is None else round(ind["bb_lower"], 2),
+                "macd_hist": None if ind["macd_hist"] is None else round(ind["macd_hist"], 6),
+                "stoch_k": None if ind["stoch_k"] is None else round(ind["stoch_k"], 2),
+            }
+            signals.append(payload)
+    return {"signals": signals}
+
+@app.get("/scan_debug")
+def scan_debug():
+    watch = _read_watchlist()
+    meta = {
+        "total": len(watch),
+        "interval": INTERVAL,
+        "period": PERIOD,
+        "rsi_len": RSI_LEN,
+        "bb_len": BB_LEN,
+        "stoch_k": STOCH_K,
+        "macd_slow": MACD_SLOW,
+    }
     ok_yf = 0
     ok_eod = 0
     too_short = 0
-    empty_or_err = 0
-
-    for sym in wl:
-        sigs, meta = analyze_symbol(sym)
-        if meta.get("error") == "too_short" or meta.get("error") == "short_history":
-            too_short += 1
-        if meta.get("source") == "yfinance" and meta.get("error") is None:
+    empty = 0
+    errors_sample = []
+    signals_preview = []
+    for sym in watch[:200]:
+        df = _fetch_yfinance(sym)
+        source = "yfinance"
+        if df.empty:
+            df = _fetch_eodhd(sym)
+            source = "eodhd" if not df.empty else "none"
+        if df.empty:
+            empty += 1
+            if len(errors_sample) < 5:
+                errors_sample.append({"symbol": sym, "source": source, "error": "no_data"})
+            continue
+        if source == "yfinance":
             ok_yf += 1
-        if meta.get("source") == "eodhd" and meta.get("error") is None:
+        elif source == "eodhd":
             ok_eod += 1
-        if meta.get("error") is not None and meta.get("error") not in ["too_short", "short_history"]:
-            empty_or_err += 1
-            errors.append(meta)
-        if sigs:
-            signals.extend(sigs)
-
-    return {
-        "signals": signals,
-        "meta": {
-            "total": len(wl),
-            "ok_yfinance": ok_yf,
-            "ok_eodhd": ok_eod,
-            "too_short": too_short,
-            "empty_or_err": empty_or_err,
-            "signals_count": len(signals),
-            "errors_sample": errors[:3],
-        },
-    }
+        if len(df) < max(RSI_LEN + 2, BB_LEN + 2, STOCH_K + 2, MACD_SLOW + 2):
+            too_short += 1
+            if len(errors_sample) < 5:
+                errors_sample.append({"symbol": sym, "source": source, "error": f"too_short_len_{len(df)}"})
+            continue
+        ind = _compute_indicators(df)
+        sig_type = _rsi_signal(ind)
+        if sig_type and len(signals_preview) < 10:
+            signals_preview.append({
+                "symbol": sym,
+                "source": source,
+                "type": sig_type,
+                "price": None if ind["price"] is None else round(ind["price"], 2),
+                "rsi": None if ind["rsi"] is None else round(ind["rsi"], 2),
+                "bb_dist_pct": None if ind["bb_dist_pct"] is None else round(ind["bb_dist_pct"], 2),
+                "macd_hist": None if ind["macd_hist"] is None else round(ind["macd_hist"], 6),
+                "stoch_k": None if ind["stoch_k"] is None else round(ind["stoch_k"], 2),
+            })
+    meta.update({
+        "ok_yfinance": ok_yf,
+        "ok_eodhd": ok_eod,
+        "too_short": too_short,
+        "empty_or_err": empty,
+        "signals_preview": signals_preview,
+        "errors_sample": errors_sample,
+    })
+    return meta
