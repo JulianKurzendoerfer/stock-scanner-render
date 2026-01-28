@@ -1,7 +1,8 @@
 fastapi
-uvicorn
-requests
+uvicorn[standard]
 pandas
+numpy
+requests
+yfinance
 pandas-ta
 pandas-market-calendars
-yfinance
