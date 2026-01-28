@@ -13,6 +13,8 @@ if not API_TOKEN:
 
 BASE = "https://eodhd.com/api"
 WATCHLIST_PATH = os.getenv("WATCHLIST_PATH", "watchlist.txt")
+DEFAULT_SUFFIX = os.getenv("DEFAULT_SUFFIX", ".US")
+
 PERIOD_RSI = int(os.getenv("RSI_PERIOD", "14"))
 BB_LEN = int(os.getenv("BB_LEN", "20"))
 BB_STD = float(os.getenv("BB_STD", "2"))
@@ -26,6 +28,12 @@ BB_MAX_DISTANCE_PCT = float(os.getenv("BB_MAX_DISTANCE_PCT", "35"))
 
 app = FastAPI()
 
+def norm_symbol(sym: str) -> str:
+    s = sym.strip()
+    if "." not in s and DEFAULT_SUFFIX:
+        return s + DEFAULT_SUFFIX
+    return s
+
 def _read_watchlist():
     if not os.path.exists(WATCHLIST_PATH):
         return []
@@ -35,7 +43,7 @@ def _read_watchlist():
             s = line.strip()
             if not s or s.startswith("#"):
                 continue
-            out.append(s)
+            out.append(norm_symbol(s))
     return out
 
 def _get_json(url, params):
@@ -97,9 +105,11 @@ def build_df_with_current(symbol):
     df = fetch_eod_daily(symbol, start, end)
     if df is None or df.empty:
         return None, None, "no_eod_data"
+
     current_price = fetch_realtime_price(symbol)
     if current_price is None or math.isnan(current_price) or current_price <= 0:
         return df, None, "no_realtime_price"
+
     last_date = df["date"].iloc[-1]
     if last_date != today:
         prev_close = float(df["close"].iloc[-1])
@@ -117,8 +127,13 @@ def build_df_with_current(symbol):
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
     else:
         df.loc[df.index[-1], "close"] = current_price
-        df.loc[df.index[-1], "high"] = max(float(df["high"].iloc[-1] or current_price), current_price)
-        df.loc[df.index[-1], "low"] = min(float(df["low"].iloc[-1] or current_price), current_price)
+        try:
+            df.loc[df.index[-1], "high"] = max(float(df["high"].iloc[-1]), current_price)
+            df.loc[df.index[-1], "low"] = min(float(df["low"].iloc[-1]), current_price)
+        except:
+            df.loc[df.index[-1], "high"] = current_price
+            df.loc[df.index[-1], "low"] = current_price
+
     return df, current_price, None
 
 def compute_indicators(df):
@@ -221,7 +236,7 @@ def scan():
 
     for sym in tickers:
         try:
-            df, current_price, err = build_df_with_current(sym)
+            df, _, err = build_df_with_current(sym)
             if df is None:
                 errors.append({"symbol": sym, "error": err or "no_data"})
                 continue
