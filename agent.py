@@ -2613,9 +2613,9 @@ def export_html_dashboard(results: list, html_path: str):
                 "t": opt.get("type", ""),
                 "k": opt.get("strike"),
                 "d": opt.get("delta"),
-                "pr": opt.get("prem_pct"),
-                "p": opt.get("premium"),
-                "otm": opt.get("otm_pct"),
+                "pr": opt.get("prem_pct") or 0.0,
+                "p": opt.get("prem_usd") or opt.get("premium") or 0.0,
+                "otm": opt.get("otm_pct") or 0.0,
                 "con": opt.get("contract", ""),
                 "note": opt.get("note", ""),
             }
@@ -3777,7 +3777,7 @@ function renderWatchlistSidebar() {{
       pill = '<span class="mono" style="font-size:10px;background:var(--amber-bg);color:var(--amber);padding:1px 5px;border-radius:3px;font-weight:700">2/4</span>';
     }}
     const shieldIcon = (d.opt && d.opt.sh) ? ' 🛡️' : '';
-    return '<div class="tv-wl-row' + isAct + '" data-wlsym="' + sym + '" onclick="selectChartSymbol(\'' + sym + '\')">' +
+    return '<div class="tv-wl-row' + isAct + '" data-wlsym="' + sym + '" onclick="selectChartSymbol(this.dataset.wlsym)">' +
       '<div>' +
         '<div style="display:flex;align-items:center;gap:4px">' + dot + '<b class="mono" style="font-size:12.5px;color:var(--txt-primary)">' + sym + '</b>' + shieldIcon + ' ' + pill + '</div>' +
         '<div style="font-size:10.5px;color:var(--txt-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:155px">' + (d.n || sym) + '</div>' +
@@ -4010,8 +4010,8 @@ function selectChartSymbol(sym) {{
     const shBadge = d.opt.sh ? '<div style="color:var(--emerald);font-weight:700;font-size:11px;margin-top:4px">🛡️ GESCHÜTZT durch S/R-Linie</div>' : '';
     document.getElementById('tvCardOpt').innerHTML =
       '<div class="mono" style="font-size:12px;font-weight:700;color:var(--txt-primary)">' + (d.opt.con || d.opt.t) + '</div>' +
-      '<div class="mono" style="font-size:11.5px;color:var(--txt-secondary);margin-top:3px">Strike: <b>' + d.opt.k.toFixed(2) + ' $</b> (OTM ' + d.opt.otm.toFixed(1) + '%) · Δ ' + d.opt.d.toFixed(2) + '</div>' +
-      '<div class="mono" style="font-size:11.5px;color:var(--emerald);font-weight:700;margin-top:2px">Prämie: +' + d.opt.p.toFixed(2) + ' $ (+' + d.opt.pr.toFixed(2) + '%)</div>' + shBadge;
+      '<div class="mono" style="font-size:11.5px;color:var(--txt-secondary);margin-top:3px">Strike: <b>' + (d.opt.k || 0).toFixed(2) + ' $</b> (OTM ' + (d.opt.otm || 0).toFixed(1) + '%) · Δ ' + (d.opt.d || 0).toFixed(2) + '</div>' +
+      '<div class="mono" style="font-size:11.5px;color:var(--emerald);font-weight:700;margin-top:2px">Prämie: +' + (d.opt.p || 0).toFixed(2) + ' $ (+' + (d.opt.pr || 0).toFixed(2) + '%)</div>' + shBadge;
   }} else if (d.opt) {{
     document.getElementById('tvCardOpt').innerHTML = '<div class="txt-muted" style="font-size:11.5px">' + (d.opt.note || 'Kein qualifizierter Weekly-Strike') + '</div>';
   }} else {{
