@@ -1957,6 +1957,30 @@ def evaluate_4_indicators(candles: list) -> dict:
     # 6. ELLIOTT-WAVE MUSTERERKENNUNG (Rein informativ als eigene Spalte – fließt NICHT in die Bewertung ein!)
     ew_info = analyze_elliott_wave(candles, rsi_series=rsi_series, macd_hist=macd_hist)
 
+    # 7. 1-Jahres-Chart-Historie (252 Handelstage + 63 Tage Indikator-Warmup = 315 Kerzen) inkl. EMA-Seeds
+    slice_len = min(len(candles), 315)
+    start_idx = len(candles) - slice_len
+    ema20_full = _ema(closes, 20)
+    ema50_full = _ema(closes, 50)
+    ema100_full = _ema(closes, 100)
+    ema200_full = _ema(closes, 200)
+    ema_seeds = [
+        round(ema20_full[start_idx], 4),
+        round(ema50_full[start_idx], 4),
+        round(ema100_full[start_idx], 4),
+        round(ema200_full[start_idx], 4),
+    ]
+    candles_1y = [
+        {
+            "t": c["time"],
+            "o": round(float(c["open"]), 2),
+            "h": round(float(c["high"]), 2),
+            "l": round(float(c["low"]), 2),
+            "c": round(float(c["close"]), 2),
+        }
+        for c in candles[start_idx:]
+    ]
+
     return {
         "last_date": candles[-1]["time"],
         "is_stale": is_stale,
@@ -1971,6 +1995,8 @@ def evaluate_4_indicators(candles: list) -> dict:
         "sr_lines": sr_info,
         "elliott_wave": ew_info,
         "option_setup": option_setup,
+        "candles_1y": candles_1y,
+        "ema_seeds": ema_seeds,
     }
 
 
@@ -2474,6 +2500,7 @@ def export_html_dashboard(results: list, html_path: str):
             f'<td class="col-asset">'
             f'<div class="asset-top">'
             f'<a href="{tv_url}" target="_blank" class="mono sym-badge">{esc(sym)}<span class="ext-arr">↗</span></a>'
+            f'<button type="button" class="chart-jump-btn mono" onclick="openStockChart(\'{esc(sym)}\')">📊 Chart</button>'
             f'<span class="cat-pill">{esc(cat)}</span>'
             f'</div>'
             f'<div class="company-name">{esc(fund.get("name", sym))}</div>'
@@ -2499,7 +2526,7 @@ def export_html_dashboard(results: list, html_path: str):
             f'</tr>'
         )
 
-    # Zweite Übersichtstabelle ganz unten: Selektive Fundamental-Kaufniveau-Matrix
+    # Zweite Übersichtstabelle: Selektive Fundamental-Kaufniveau-Matrix
     fund_overview_rows = []
     for r in top_fundamentals:
         sym = r.get("symbol", "")
@@ -2519,7 +2546,10 @@ def export_html_dashboard(results: list, html_path: str):
 
         fund_overview_rows.append(
             f'<tr>'
-            f'<td><a href="{tv_url}" target="_blank" class="mono sym-badge">{esc(sym)}<span class="ext-arr">↗</span></a>'
+            f'<td><div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">'
+            f'<a href="{tv_url}" target="_blank" class="mono sym-badge">{esc(sym)}<span class="ext-arr">↗</span></a>'
+            f'<button type="button" class="chart-jump-btn mono" onclick="openStockChart(\'{esc(sym)}\')">📊 Chart</button>'
+            f'</div>'
             f'<div class="company-name" style="margin-top:4px">{esc(fund.get("name", ""))} · <span class="txt-muted">{esc(cat)}</span></div></td>'
             f'<td class="mono price-main">{close:.2f} $ {chg_html}</td>'
             f'<td><span class="tier-badge {f_cls}">{f_lbl}</span> <span class="mono score-chip">{fund.get("fund_score", 0)}/100</span>'
@@ -2551,131 +2581,80 @@ def export_html_dashboard(results: list, html_path: str):
         except Exception:
             icon_data_uri = ""
 
-    # Lade 4-Jahres-Backtest-Daten für den integrierten Backtest-Tab in Version 1
-    bt_section_html = ""
-    bt_json_path = os.path.join(base_dir, "backtest_4y_results.json")
-    if os.path.exists(bt_json_path):
-        try:
-            with open(bt_json_path, "r", encoding="utf-8") as f_bt:
-                bt_data = json.load(f_bt)
-            aq = bt_data.get("all_quality", {})
-            sim_f = aq.get("sim_fixed", {})
-            sim_c = aq.get("sim_comp", {})
-            pf_trades = sim_f.get("executed_trades", [])
-            n_pf = len(pf_trades)
-            pf_not_ass = sum(1 for t in pf_trades if t.get("not_assigned"))
-            pf_ass_rec = sum(1 for t in pf_trades if t.get("assigned") and t.get("recovered"))
-            pf_ass_open = sum(1 for t in pf_trades if t.get("assigned") and not t.get("recovered"))
-            pf_won = pf_not_ass + pf_ass_rec
+    # Kompaktes 1-Jahres-Chart-Datenpaket (inkl. Indikator-Warmup, S/R-Linien & Options-Strikes) für alle validen Aktien
+    all_dates_set = set()
+    for r in valid:
+        for c in (r.get("candles_1y") or []):
+            all_dates_set.add(c["t"])
+    master_dates = sorted(all_dates_set)
+    date_to_idx = {d: idx for idx, d in enumerate(master_dates)}
 
-            curve_f = sim_f.get("weekly_curve", [])
-            curve_c = sim_c.get("weekly_curve", [])
-            w_svg, h_svg = 960, 240
-            pad_l, pad_r, pad_t, pad_b = 70, 25, 18, 28
-            max_val = max((c.get("total_account_value", 100000) for c in curve_c), default=210000) * 1.03
-            min_val = 96000.0
+    chart_data_map = {}
+    chart_order = []
+    for r in valid:
+        sym = r.get("symbol", "")
+        if not sym:
+            continue
+        chart_order.append(sym)
+        c_list = r.get("candles_1y") or []
+        flat_c = []
+        for c in c_list:
+            flat_c.extend([date_to_idx.get(c["t"], 0), c["o"], c["h"], c["l"], c["c"]])
+        sr = r.get("sr_lines") or {}
+        opt = r.get("option_setup") or {}
+        fund = r.get("fundamentals") or {}
+        ew = r.get("elliott_wave") or {}
+        ind = r.get("indicators") or {}
+        opt_compact = None
+        if opt and opt.get("strike"):
+            opt_compact = {
+                "q": bool(opt.get("qualified")),
+                "sh": bool(opt.get("sr_protected")),
+                "t": opt.get("type", ""),
+                "k": opt.get("strike"),
+                "d": opt.get("delta"),
+                "pr": opt.get("prem_pct"),
+                "p": opt.get("premium"),
+                "otm": opt.get("otm_pct"),
+                "con": opt.get("contract", ""),
+                "note": opt.get("note", ""),
+            }
+        chart_data_map[sym] = {
+            "n": fund.get("name", sym),
+            "cat": r.get("category", ""),
+            "last": r.get("last_close", 0.0),
+            "chg": r.get("change_pct"),
+            "lvl": r.get("signal_level", "NEUTRAL"),
+            "sig": r.get("signal", "NEUTRAL"),
+            "bull": r.get("bullish_count", 0),
+            "bear": r.get("bearish_count", 0),
+            "es": r.get("ema_seeds") or [],
+            "c": flat_c,
+            "sup": [{"p": s["price"], "b": s["bounces"], "v": s["pivots"], "d": s["dist_pct"]} for s in (sr.get("supports") or [])[:5]],
+            "res": [{"p": s["price"], "b": s["bounces"], "v": s["pivots"], "d": s["dist_pct"]} for s in (sr.get("resistances") or [])[:5]],
+            "opt": opt_compact,
+            "ind": {
+                "bb": (ind.get("BB") or {}).get("dir", 0),
+                "rsi": (ind.get("RSI") or {}).get("dir", 0),
+                "macd": (ind.get("MACD") or {}).get("dir", 0),
+                "stoch": (ind.get("STOCH") or {}).get("dir", 0),
+            },
+            "rsn": r.get("reasons") or [],
+            "ew": {
+                "w": ew.get("wave_code", ""),
+                "ph": ew.get("phase", ""),
+                "pr": ew.get("primary_prob", 50),
+                "sc": ew.get("primary_scenario", ""),
+                "tgt": ew.get("target_price"),
+                "inv": ew.get("invalidation_price"),
+            },
+            "fs": fund.get("fund_score", 0),
+            "fl": fund.get("level_label", ""),
+        }
 
-            def _pt_xy(idx_p: int, val_p: float) -> str:
-                xp = pad_l + (idx_p / max(len(curve_f) - 1, 1)) * (w_svg - pad_l - pad_r)
-                yp = pad_t + (1.0 - (val_p - min_val) / max(max_val - min_val, 1.0)) * (h_svg - pad_t - pad_b)
-                return f"{xp:.1f},{yp:.1f}"
-
-            pts_f = " ".join(_pt_xy(i, c.get("total_account_value", 100000)) for i, c in enumerate(curve_f))
-            pts_c = " ".join(_pt_xy(i, c.get("total_account_value", 100000)) for i, c in enumerate(curve_c))
-
-            bt_rows = []
-            for t in list(reversed(pf_trades))[:80]:
-                if t.get("not_assigned"):
-                    st_b = '<span class="sig-badge sig-strong-buy" style="padding:2px 7px;font-size:10px">WERTLOS VERFALLEN (SOFORT FREI)</span>'
-                    h_s = "0T (Freitag frei)"
-                elif t.get("recovered"):
-                    st_b = f'<span class="tier-badge tier-good" style="padding:2px 7px;font-size:10px">BEI STRIKE VERKAUFT ({esc(t.get("recovery_date"))})</span>'
-                    h_s = f'{t.get("recovery_trading_days", 0)} Handelstage ({t.get("recovery_cal_days", 0)} KT)'
-                else:
-                    st_b = '<span class="sig-badge sig-strong-sell" style="padding:2px 7px;font-size:10px">AM ENDE NOCH IM BESTAND</span>'
-                    h_s = f'Offen (-{t.get("unrealized_loss_pct", 0):.1f}%)'
-                bt_rows.append(
-                    f'<tr>'
-                    f'<td class="mono">{esc(t.get("entry_date"))} ({esc(t.get("weekday"))})</td>'
-                    f'<td class="mono"><b class="txt-bright">{esc(t.get("symbol"))}</b> <span class="cat-pill">{esc(t.get("category"))}</span></td>'
-                    f'<td class="mono">{t.get("score")}/4</td>'
-                    f'<td class="mono">{t.get("entry_price", 0):.2f} $</td>'
-                    f'<td class="mono txt-bright">{t.get("strike", 0):.2f} $ <span class="txt-muted">(-{t.get("otm_pct", 0):.1f}%)</span></td>'
-                    f'<td class="mono">Δ {t.get("delta", 0):.2f}</td>'
-                    f'<td class="mono">{t.get("fri_close", 0):.2f} $</td>'
-                    f'<td>{st_b}</td>'
-                    f'<td class="mono">{h_s}</td>'
-                    f'<td class="mono">{t.get("alloc_eur", 0):,.0f} €</td>'
-                    f'<td class="mono txt-emerald" style="font-weight:700">+{t.get("prem_eur", 0):,.2f} € (+{t.get("prem_pct", 0):.2f}%)</td>'
-                    f'</tr>'
-                )
-
-            bt_section_html = f"""
-            <div class="kpi-grid">
-              <div class="kpi-card">
-                <span class="kpi-lbl">Endkapital (Konstant 100k €)</span>
-                <span class="kpi-val mono txt-emerald">{sim_f.get("final_equity_eur", 171540.13):,.2f} €</span>
-                <span class="kpi-sub">Netto-Gewinn: +{sim_f.get("net_total_profit_eur", 71540.13):,.2f} € (+17,89% p.a.)</span>
-              </div>
-              <div class="kpi-card">
-                <span class="kpi-lbl">Endkapital (Mit Zinseszins)</span>
-                <span class="kpi-val mono txt-sky">{sim_c.get("final_equity_eur", 206426.16):,.2f} €</span>
-                <span class="kpi-sub">Netto-Gewinn: +{sim_c.get("net_total_profit_eur", 106426.16):,.2f} € (CAGR +19,86% p.a.)</span>
-              </div>
-              <div class="kpi-card">
-                <span class="kpi-lbl">Aufgegangene Portfolio-Trades</span>
-                <span class="kpi-val mono txt-emerald">{pf_won} / {n_pf} (99,62%)</span>
-                <span class="kpi-sub">{pf_not_ass} direkt frei · {pf_ass_rec} bei Strike verkauft · {pf_ass_open} offen</span>
-              </div>
-              <div class="kpi-card">
-                <span class="kpi-lbl">Median Haltedauer (Einbuchung)</span>
-                <span class="kpi-val mono" style="color:var(--amber)">2 Handelstage</span>
-                <span class="kpi-sub">76,2% in &le; 1 Woche frei · 90,0% in &le; 1 Monat frei</span>
-              </div>
-              <div class="kpi-card">
-                <span class="kpi-lbl">Ø Monatlicher Prämien-Cashflow</span>
-                <span class="kpi-val mono txt-bright">+1.544 € / Mo</span>
-                <span class="kpi-sub">Sharpe Ratio 6,45 · Profit Factor 28,8x</span>
-              </div>
-            </div>
-            <div class="table-wrap" style="padding:16px 18px;margin-bottom:18px">
-              <div class="kpi-lbl" style="margin-bottom:10px">KAPITALENTWICKLUNG ÜBER 4 JAHRE (14.11.2022 – 12.11.2026 · GRÜN = KONSTANT 100.000 € · BLAU = MIT ZINSESZINS)</div>
-              <svg viewBox="0 0 {w_svg} {h_svg}" style="width:100%;height:auto;background:#080d16;border:1px solid var(--border-subtle);border-radius:6px">
-                <line x1="{pad_l}" y1="{pad_t}" x2="{w_svg-pad_r}" y2="{pad_t}" stroke="#1e293b" stroke-dasharray="3,3"/>
-                <line x1="{pad_l}" y1="{(pad_t+h_svg-pad_b)/2}" x2="{w_svg-pad_r}" y2="{(pad_t+h_svg-pad_b)/2}" stroke="#1e293b" stroke-dasharray="3,3"/>
-                <line x1="{pad_l}" y1="{h_svg-pad_b}" x2="{w_svg-pad_r}" y2="{h_svg-pad_b}" stroke="#1e293b"/>
-                <text x="8" y="{pad_t+4}" fill="#94a3b8" font-size="10" font-family="monospace">{max_val:,.0f} €</text>
-                <text x="8" y="{(pad_t+h_svg-pad_b)/2+4}" fill="#94a3b8" font-size="10" font-family="monospace">{(max_val+min_val)/2:,.0f} €</text>
-                <text x="8" y="{h_svg-pad_b+4}" fill="#94a3b8" font-size="10" font-family="monospace">100.000 €</text>
-                <polyline fill="none" stroke="#38bdf8" stroke-width="2.4" points="{pts_c}"/>
-                <polyline fill="none" stroke="#10b981" stroke-width="2.4" points="{pts_f}"/>
-              </svg>
-            </div>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Einstieg</th>
-                    <th>Ticker</th>
-                    <th>Score</th>
-                    <th>Kurs</th>
-                    <th>Strike (OTM)</th>
-                    <th>Delta</th>
-                    <th>Fr-Schluss</th>
-                    <th>Ergebnis (Halten bis Strike)</th>
-                    <th>Haltedauer Aktie</th>
-                    <th>Einsatz</th>
-                    <th>Prämie (€ / %)</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {"".join(bt_rows)}
-                </tbody>
-              </table>
-            </div>
-            """
-        except Exception:
-            bt_section_html = '<div class="txt-muted">Backtest-Daten werden beim nächsten Lauf geladen.</div>'
+    master_dates_json = json.dumps(master_dates, separators=(",", ":"))
+    chart_order_json = json.dumps(chart_order, separators=(",", ":"))
+    chart_data_json = json.dumps(chart_data_map, ensure_ascii=False, separators=(",", ":"))
 
     icon_link_tags = ""
     brand_icon_html = '<div class="brand-mark">V1</div>'
@@ -3125,6 +3104,146 @@ def export_html_dashboard(results: list, html_path: str):
     gap: 10px;
   }}
   .section-hdr h2 {{ margin: 0; font-size: 16px; font-weight: 700; letter-spacing: -0.2px; }}
+
+  .chart-jump-btn {{
+    background: rgba(56, 189, 248, 0.12);
+    color: var(--sky);
+    border: 1px solid rgba(56, 189, 248, 0.35);
+    padding: 3px 7px;
+    border-radius: 4px;
+    font-size: 10.5px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }}
+  .chart-jump-btn:hover {{
+    background: rgba(56, 189, 248, 0.25);
+    border-color: var(--sky);
+    color: #fff;
+  }}
+
+  /* TradingView 4-Pane UMWA Workstation ("Julian Layout") */
+  .tv-workstation {{
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    gap: 14px;
+    align-items: start;
+  }}
+  @media (max-width: 1120px) {{
+    .tv-workstation {{ grid-template-columns: 1fr; }}
+  }}
+  .tv-main {{
+    background: #0b0f17;
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 14px 34px -10px rgba(0,0,0,0.65);
+  }}
+  .tv-toolbar {{
+    background: #101622;
+    border-bottom: 1px solid var(--border-subtle);
+    padding: 10px 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+  }}
+  .tv-sym-group {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
+  .tv-sym-title {{ font-size: 16px; font-weight: 800; color: var(--txt-primary); letter-spacing: -0.3px; }}
+  .tv-ohlc-bar {{
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    font-size: 11.5px; color: var(--txt-secondary);
+    background: rgba(15, 23, 42, 0.75);
+    padding: 4px 10px; border-radius: 5px; border: 1px solid #1e293b;
+  }}
+  .tv-ohlc-bar span b {{ color: var(--txt-primary); }}
+  .tv-btn-group {{ display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }}
+  .tv-mini-btn {{
+    background: #161f30; color: var(--txt-secondary);
+    border: 1px solid #26334d; padding: 4px 9px; border-radius: 4px;
+    font-size: 11px; font-weight: 700; cursor: pointer; transition: all 0.12s;
+  }}
+  .tv-mini-btn:hover {{ border-color: var(--sky); color: var(--txt-primary); }}
+  .tv-mini-btn.active {{
+    background: rgba(56, 189, 248, 0.18);
+    color: var(--sky);
+    border-color: rgba(56, 189, 248, 0.55);
+  }}
+  .tv-canvas-wrap {{
+    position: relative;
+    width: 100%;
+    height: 740px;
+    background: #090d14;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: pan-y;
+  }}
+  @media (max-width: 768px) {{
+    .tv-canvas-wrap {{ height: 620px; }}
+  }}
+  #umwaChartCanvas {{
+    width: 100%;
+    height: 100%;
+    display: block;
+    cursor: crosshair;
+  }}
+  .tv-bottom-cards {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 12px;
+    padding: 14px;
+    background: #0d121c;
+    border-top: 1px solid var(--border-subtle);
+  }}
+  .tv-info-card {{
+    background: #121926;
+    border: 1px solid var(--border-subtle);
+    border-radius: 7px;
+    padding: 11px 13px;
+    font-size: 12px;
+  }}
+  .tv-info-hdr {{
+    font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.5px; color: var(--txt-muted); margin-bottom: 6px;
+  }}
+  .tv-sidebar {{
+    background: #0d121c;
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    max-height: 890px;
+  }}
+  .tv-side-hdr {{
+    padding: 12px;
+    background: #111826;
+    border-bottom: 1px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }}
+  .tv-wl-list {{
+    overflow-y: auto;
+    flex: 1;
+    divide-y: 1px solid #161f30;
+  }}
+  .tv-wl-row {{
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    gap: 8px;
+    align-items: center;
+    padding: 8px 12px;
+    border-bottom: 1px solid rgba(30, 41, 59, 0.55);
+    cursor: pointer;
+    transition: background 0.1s;
+  }}
+  .tv-wl-row:hover {{ background: #162032; }}
+  .tv-wl-row.active {{
+    background: rgba(56, 189, 248, 0.14);
+    border-left: 3px solid var(--sky);
+  }}
 </style>
 </head>
 <body>
@@ -3133,14 +3252,14 @@ def export_html_dashboard(results: list, html_path: str):
       {brand_icon_html}
       <div>
         <h1 class="brand-title">MARKET VISION PRO <span class="v1-badge">VERSION 1</span></h1>
-        <div class="brand-sub">4 UMWA-Indikatoren · Validierte S/R-Cluster · OCC/IBKR Options-Strikes · Elliott-Wave · Fundamental &amp; 4J-Backtest{esc(inactive_note)}</div>
+        <div class="brand-sub">4 UMWA-Indikatoren · 1J TradingView-Charts · Validierte S/R-Linien · OCC/IBKR Options-Strikes · Elliott-Wave &amp; Fundamental{esc(inactive_note)}</div>
       </div>
     </div>
     <div class="top-actions">
       <div class="view-nav">
-        <button class="view-btn active" onclick="switchMainView('scanner', this)">Live-Scanner ({len(valid)})</button>
-        <button class="view-btn" onclick="switchMainView('fundamentals', this)">Kauf-Niveau ({len(top_fundamentals)})</button>
-        <button class="view-btn" onclick="switchMainView('backtest', this)">4J-Backtest (100k €)</button>
+        <button class="view-btn active" id="nav-scanner" onclick="switchMainView('scanner', this)">Live-Scanner ({len(valid)})</button>
+        <button class="view-btn" id="nav-charts" onclick="switchMainView('charts', this)">📊 UMWA Charts (1J)</button>
+        <button class="view-btn" id="nav-fundamentals" onclick="switchMainView('fundamentals', this)">Kauf-Niveau ({len(top_fundamentals)})</button>
       </div>
       <button id="refreshBtn" class="action-btn" onclick="triggerLiveRefresh()">↻ Live-Update</button>
       <button class="action-btn action-btn-gold" onclick="openShareModal()">📲 iPad / Handy &amp; Bruder-App</button>
@@ -3251,16 +3370,81 @@ def export_html_dashboard(results: list, html_path: str):
     </div>
     </div>
 
-    <div id="view-backtest" style="display:none">
-      <div class="section-hdr" style="margin-top:8px">
-        <div>
-          <h2>4-JAHRES SHORT-PUT &amp; HOLD-TO-STRIKE BACKTEST (14.11.2022 – 12.11.2026 · 100.000 € PORTFOLIO)</h2>
-          <div class="brand-sub" style="margin-top:4px;display:block">
-            Nur Short Puts (Mo/Di &rarr; Fr, Delta &le; 0,30, OTM &ge; 2,0%, Prämie 0,7–1,4%). Bei Einbuchung wird die Aktie exakt so lange gehalten, bis der Kurs wieder das Strike-Niveau erreicht und dort für &plusmn;0 € Kursdifferenz (+ volle Optionsprämie) verkauft.
+    <div id="view-charts" style="display:none">
+      <div class="tv-workstation">
+        <div class="tv-main">
+          <div class="tv-toolbar">
+            <div class="tv-sym-group">
+              <span id="tvSymTitle" class="tv-sym-title mono">HAL</span>
+              <span id="tvCompName" style="font-size:12.5px;color:var(--txt-secondary);font-weight:600">Halliburton Co. · 1D</span>
+              <span id="tvCatBadge" class="cat-pill">C-WERTE</span>
+              <span id="tvSigBadge" class="sig-badge sig-strong-buy" style="padding:3px 8px;font-size:11px">BUY (3/4)</span>
+              <a id="tvExtLink" href="https://de.tradingview.com/chart/?symbol=HAL" target="_blank" class="tv-mini-btn mono" style="text-decoration:none">TradingView ↗</a>
+            </div>
+            <div id="tvOhlcBar" class="tv-ohlc-bar mono">
+              <span>Datum: <b>—</b></span>
+              <span>O <b>—</b></span>
+              <span>H <b>—</b></span>
+              <span>L <b>—</b></span>
+              <span>C <b>—</b></span>
+            </div>
+            <div class="tv-btn-group">
+              <button type="button" class="tv-mini-btn mono" onclick="setChartRange(65, this)">3M</button>
+              <button type="button" class="tv-mini-btn mono" onclick="setChartRange(126, this)">6M</button>
+              <button type="button" class="tv-mini-btn mono active" onclick="setChartRange(252, this)">1J (252T)</button>
+              <span style="width:1px;height:16px;background:#26334d;margin:0 4px"></span>
+              <button type="button" id="togBB" class="tv-mini-btn active" onclick="toggleChartLayer('bb', this)">BB (20,2)</button>
+              <button type="button" id="togEMA" class="tv-mini-btn active" onclick="toggleChartLayer('ema', this)">EMAs</button>
+              <button type="button" id="togSR" class="tv-mini-btn active" onclick="toggleChartLayer('sr', this)">🔵 S/R-Linien</button>
+              <button type="button" id="togOpt" class="tv-mini-btn active" onclick="toggleChartLayer('opt', this)">🛡️ Strike</button>
+            </div>
+          </div>
+
+          <div class="tv-canvas-wrap">
+            <canvas id="umwaChartCanvas"></canvas>
+          </div>
+
+          <div class="tv-bottom-cards">
+            <div class="tv-info-card">
+              <div class="tv-info-hdr">4 UMWA-Indikatoren &amp; Auslöser</div>
+              <div id="tvCardInd"></div>
+            </div>
+            <div class="tv-info-card">
+              <div class="tv-info-hdr">🔵 Validierte Horizontale S/R-Linien</div>
+              <div id="tvCardSR"></div>
+            </div>
+            <div class="tv-info-card">
+              <div class="tv-info-hdr">🛡️ Weekly Stillhalter-Option (Mo/Di &rarr; Fr)</div>
+              <div id="tvCardOpt"></div>
+            </div>
+            <div class="tv-info-card">
+              <div class="tv-info-hdr">Elliott-Wave &amp; Fundamental-Niveau</div>
+              <div id="tvCardEW"></div>
+            </div>
           </div>
         </div>
+
+        <aside class="tv-sidebar">
+          <div class="tv-side-hdr">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <span style="font-size:12.5px;font-weight:800;color:var(--txt-primary)">WATCHLIST · 1J CHARTS</span>
+              <span id="tvWlCount" class="mono" style="font-size:11px;color:var(--txt-muted)">{len(valid)} Werte</span>
+            </div>
+            <div class="tv-btn-group">
+              <button type="button" class="tv-mini-btn active" onclick="setWlFilter('all', this)">Alle</button>
+              <button type="button" class="tv-mini-btn" onclick="setWlFilter('main', this)">3–4/4 Signale</button>
+              <button type="button" class="tv-mini-btn" onclick="setWlFilter('shield', this)">🛡️ Geschützt</button>
+              <button type="button" class="tv-mini-btn" onclick="setWlFilter('watch', this)">2/4 Watch</button>
+            </div>
+            <select id="tvWlCat" class="select-box" style="width:100%;font-size:11.5px;padding:6px 8px" onchange="renderWatchlistSidebar()">
+              <option value="ALL">Alle Kategorien ({len(valid)})</option>
+              {cat_options_html}
+            </select>
+            <input id="tvWlSearch" type="text" class="input-box" style="width:100%;min-width:0;font-size:12px;padding:6px 10px" placeholder="Ticker oder Name suchen... (↑/↓ Tasten)" oninput="renderWatchlistSidebar()">
+          </div>
+          <div id="tvWlList" class="tv-wl-list"></div>
+        </aside>
       </div>
-      {bt_section_html}
     </div>
   </main>
 
@@ -3281,7 +3465,7 @@ def export_html_dashboard(results: list, html_path: str):
       <div class="step-card">
         <div style="font-weight:700;color:var(--txt-primary);margin-bottom:6px"><span class="step-num">WEG 1</span>Direkt als App-Datei an deinen Bruder oder dein iPad/iPhone senden (AirDrop, WhatsApp, iMessage, Mail)</div>
         <div style="font-size:12px;color:var(--txt-secondary);margin-bottom:10px">
-          Die Datei <b>Version_1_App.html</b> enthält die komplette App inkl. App-Icon, allen 255 Aktien, Fundamental-Matrix und 4-Jahres-Backtest. Sie funktioniert auf jedem iPad, iPhone, Android-Handy und Mac auch komplett unabhängig!
+          Die Datei <b>Version_1_App.html</b> enthält die komplette App inkl. App-Icon, allen 255 Aktien, 1-Jahres-TradingView-Charts und Fundamental-Matrix. Sie funktioniert auf jedem iPad, iPhone, Android-Handy und Mac auch komplett unabhängig!
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap">
           <button class="action-btn action-btn-gold" onclick="shareAppFile()">📤 Jetzt per AirDrop / WhatsApp / Teilen senden</button>
@@ -3320,16 +3504,41 @@ def export_html_dashboard(results: list, html_path: str):
   </div>
 
 <script>
+const MASTER_DATES = {master_dates_json};
+const CHART_ORDER = {chart_order_json};
+const CHART_DATA = {chart_data_json};
+
 let currentMode = 'main';
 let sortState = {{ key: null, asc: false }};
+let activeChartSym = CHART_ORDER[0] || 'HAL';
+let chartBarsCount = 252;
+let chartLayers = {{ bb: true, ema: true, sr: true, opt: true }};
+let wlFilterMode = 'all';
+let hoverBarIdx = null;
+let cachedChartCalc = null;
 
 function switchMainView(view, btn) {{
   document.getElementById('view-scanner').style.display = (view === 'scanner') ? '' : 'none';
+  document.getElementById('view-charts').style.display = (view === 'charts') ? '' : 'none';
   document.getElementById('view-fundamentals').style.display = (view === 'fundamentals') ? '' : 'none';
-  document.getElementById('view-backtest').style.display = (view === 'backtest') ? '' : 'none';
   document.querySelectorAll('.view-btn').forEach(b => b.classList.remove('active'));
   if (btn) btn.classList.add('active');
+  else {{
+    const navBtn = document.getElementById('nav-' + view);
+    if (navBtn) navBtn.classList.add('active');
+  }}
+  if (view === 'charts') {{
+    renderWatchlistSidebar();
+    selectChartSymbol(activeChartSym);
+  }}
   window.scrollTo({{ top: 0, behavior: 'smooth' }});
+}}
+
+function openStockChart(sym) {{
+  if (CHART_DATA[sym]) {{
+    activeChartSym = sym;
+  }}
+  switchMainView('charts', document.getElementById('nav-charts'));
 }}
 
 function setFilter(mode, btn) {{
@@ -3513,6 +3722,800 @@ async function shareAppFile() {{
   a.download = 'Version_1_App.html';
   a.click();
 }}
+
+// =====================================================================
+// TRADINGVIEW 4-PANE UMWA CHART ENGINE (1 JAHR + BLAUE S/R-LINIEN)
+// =====================================================================
+
+function setWlFilter(mode, btn) {{
+  wlFilterMode = mode;
+  document.querySelectorAll('.tv-side-hdr .tv-mini-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  renderWatchlistSidebar();
+}}
+
+function getFilteredChartSymbols() {{
+  const cat = (document.getElementById('tvWlCat') || {{ value: 'ALL' }}).value;
+  const q = ((document.getElementById('tvWlSearch') || {{ value: '' }}).value || '').trim().toLowerCase();
+  return CHART_ORDER.filter(sym => {{
+    const d = CHART_DATA[sym];
+    if (!d) return false;
+    const isMain = (d.lvl === 'STRONG_BUY' || d.lvl === 'STRONG_SELL');
+    const isWatch = (d.lvl === 'WEAK_BUY' || d.lvl === 'WEAK_SELL');
+    const isShield = isMain && d.opt && d.opt.q && d.opt.sh;
+    if (wlFilterMode === 'main' && !isMain) return false;
+    if (wlFilterMode === 'shield' && !isShield) return false;
+    if (wlFilterMode === 'watch' && !(isMain || isWatch)) return false;
+    if (cat !== 'ALL' && d.cat !== cat) return false;
+    if (q && !(sym.toLowerCase().includes(q) || (d.n || '').toLowerCase().includes(q))) return false;
+    return true;
+  }});
+}}
+
+function renderWatchlistSidebar() {{
+  const listEl = document.getElementById('tvWlList');
+  if (!listEl) return;
+  const syms = getFilteredChartSymbols();
+  const cntEl = document.getElementById('tvWlCount');
+  if (cntEl) cntEl.textContent = syms.length + ' Werte';
+
+  const html = syms.map(sym => {{
+    const d = CHART_DATA[sym];
+    const isAct = (sym === activeChartSym) ? ' active' : '';
+    const chg = d.chg != null ? (d.chg >= 0 ? '+' + d.chg.toFixed(2) + '%' : d.chg.toFixed(2) + '%') : '—';
+    const chgClr = (d.chg || 0) >= 0 ? 'var(--emerald)' : 'var(--rose)';
+    let dot = '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#475569;margin-right:6px"></span>';
+    let pill = '';
+    if (d.lvl === 'STRONG_BUY') {{
+      dot = '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--emerald);box-shadow:0 0 6px var(--emerald);margin-right:6px"></span>';
+      pill = '<span class="mono" style="font-size:10px;background:var(--emerald-bg);color:var(--emerald);padding:1px 5px;border-radius:3px;font-weight:700">' + d.bull + '/4 BUY</span>';
+    }} else if (d.lvl === 'STRONG_SELL') {{
+      dot = '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--rose);box-shadow:0 0 6px var(--rose);margin-right:6px"></span>';
+      pill = '<span class="mono" style="font-size:10px;background:var(--rose-bg);color:var(--rose);padding:1px 5px;border-radius:3px;font-weight:700">' + d.bear + '/4 SELL</span>';
+    }} else if (d.lvl === 'WEAK_BUY' || d.lvl === 'WEAK_SELL') {{
+      dot = '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--amber);margin-right:6px"></span>';
+      pill = '<span class="mono" style="font-size:10px;background:var(--amber-bg);color:var(--amber);padding:1px 5px;border-radius:3px;font-weight:700">2/4</span>';
+    }}
+    const shieldIcon = (d.opt && d.opt.sh) ? ' 🛡️' : '';
+    return '<div class="tv-wl-row' + isAct + '" data-wlsym="' + sym + '" onclick="selectChartSymbol(\'' + sym + '\')">' +
+      '<div>' +
+        '<div style="display:flex;align-items:center;gap:4px">' + dot + '<b class="mono" style="font-size:12.5px;color:var(--txt-primary)">' + sym + '</b>' + shieldIcon + ' ' + pill + '</div>' +
+        '<div style="font-size:10.5px;color:var(--txt-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:155px">' + (d.n || sym) + '</div>' +
+      '</div>' +
+      '<div class="mono" style="font-size:12px;font-weight:700;color:var(--txt-primary);text-align:right">' + d.last.toFixed(2) + '</div>' +
+      '<div class="mono" style="font-size:11px;font-weight:600;color:' + chgClr + ';text-align:right;min-width:54px">' + chg + '</div>' +
+    '</div>';
+  }}).join('');
+  listEl.innerHTML = html || '<div style="padding:18px;color:var(--txt-muted);font-size:12px">Keine Werte für diesen Filter gefunden.</div>';
+}}
+
+function setChartRange(bars, btn) {{
+  chartBarsCount = bars;
+  document.querySelectorAll('.tv-toolbar .tv-btn-group .tv-mini-btn.mono').forEach(b => {{
+    if (b.textContent.includes('M') || b.textContent.includes('1J')) b.classList.remove('active');
+  }});
+  if (btn) btn.classList.add('active');
+  hoverBarIdx = null;
+  if (activeChartSym) {{
+    cachedChartCalc = computeUmwaSeries(activeChartSym);
+    drawUmwaChart();
+  }}
+}}
+
+function toggleChartLayer(key, btn) {{
+  chartLayers[key] = !chartLayers[key];
+  if (btn) btn.classList.toggle('active', chartLayers[key]);
+  drawUmwaChart();
+}}
+
+function computeEmaWithSeed(vals, span, seedVal) {{
+  const out = new Array(vals.length);
+  if (!vals.length) return out;
+  const alpha = 2.0 / (span + 1.0);
+  out[0] = (seedVal != null && !isNaN(seedVal)) ? seedVal : vals[0];
+  for (let i = 1; i < vals.length; i++) {{
+    out[i] = alpha * vals[i] + (1.0 - alpha) * out[i - 1];
+  }}
+  return out;
+}}
+
+function computeStochSeries(highs, lows, closes, kLen, kSmooth, dSmooth) {{
+  const n = closes.length;
+  const rawK = new Array(n).fill(null);
+  for (let i = kLen - 1; i < n; i++) {{
+    let hh = -Infinity, ll = Infinity;
+    for (let j = i - kLen + 1; j <= i; j++) {{
+      if (highs[j] > hh) hh = highs[j];
+      if (lows[j] < ll) ll = lows[j];
+    }}
+    rawK[i] = (hh === ll) ? 0.0 : 100.0 * (closes[i] - ll) / (hh - ll);
+  }}
+  const kArr = new Array(n).fill(null);
+  for (let i = 0; i < n; i++) {{
+    let s = 0, c = 0;
+    for (let j = Math.max(0, i - kSmooth + 1); j <= i; j++) {{
+      if (rawK[j] != null) {{ s += rawK[j]; c++; }}
+    }}
+    if (c === kSmooth) kArr[i] = s / c;
+  }}
+  const dArr = new Array(n).fill(null);
+  for (let i = 0; i < n; i++) {{
+    let s = 0, c = 0;
+    for (let j = Math.max(0, i - dSmooth + 1); j <= i; j++) {{
+      if (kArr[j] != null) {{ s += kArr[j]; c++; }}
+    }}
+    if (c === dSmooth) dArr[i] = s / c;
+  }}
+  return {{ k: kArr, d: dArr }};
+}}
+
+function computeUmwaSeries(sym) {{
+  const d = CHART_DATA[sym];
+  if (!d || !d.c || !d.c.length) return null;
+  const flat = d.c;
+  const total = Math.floor(flat.length / 5);
+  const dates = new Array(total);
+  const opens = new Array(total);
+  const highs = new Array(total);
+  const lows = new Array(total);
+  const closes = new Array(total);
+
+  for (let i = 0; i < total; i++) {{
+    const base = i * 5;
+    dates[i] = MASTER_DATES[flat[base]] || '';
+    opens[i] = flat[base + 1];
+    highs[i] = flat[base + 2];
+    lows[i] = flat[base + 3];
+    closes[i] = flat[base + 4];
+  }}
+
+  // 1. Bollinger Bands (20, 2.0)
+  const bbMid = new Array(total).fill(null);
+  const bbUpper = new Array(total).fill(null);
+  const bbLower = new Array(total).fill(null);
+  for (let i = 19; i < total; i++) {{
+    let sum = 0;
+    for (let j = i - 19; j <= i; j++) sum += closes[j];
+    const m = sum / 20.0;
+    let vSum = 0;
+    for (let j = i - 19; j <= i; j++) {{
+      const diff = closes[j] - m;
+      vSum += diff * diff;
+    }}
+    const sd = Math.sqrt(vSum / 20.0);
+    bbMid[i] = m;
+    bbUpper[i] = m + 2.0 * sd;
+    bbLower[i] = m - 2.0 * sd;
+  }}
+
+  // 2. EMAs (20, 50, 100, 200) mit 2J-Seeds
+  const seeds = d.es || [];
+  const ema20 = computeEmaWithSeed(closes, 20, seeds[0]);
+  const ema50 = computeEmaWithSeed(closes, 50, seeds[1]);
+  const ema100 = computeEmaWithSeed(closes, 100, seeds[2]);
+  const ema200 = computeEmaWithSeed(closes, 200, seeds[3]);
+
+  // 3. Stochastik UMWA Dual (Kurz 14,5,3 & Lang 50,6,5)
+  const stShort = computeStochSeries(highs, lows, closes, 14, 5, 3);
+  const stLong = computeStochSeries(highs, lows, closes, 50, 6, 5);
+
+  // 4. RSI UMWA (14)
+  const rsi = new Array(total).fill(null);
+  if (total > 14) {{
+    let avgG = 0, avgL = 0;
+    for (let i = 1; i <= 14; i++) {{
+      const ch = closes[i] - closes[i - 1];
+      if (ch > 0) avgG += ch; else avgL -= ch;
+    }}
+    avgG /= 14.0; avgL /= 14.0;
+    rsi[14] = avgL === 0 ? 100.0 : 100.0 - (100.0 / (1.0 + avgG / avgL));
+    for (let i = 15; i < total; i++) {{
+      const ch = closes[i] - closes[i - 1];
+      const g = ch > 0 ? ch : 0;
+      const l = ch < 0 ? -ch : 0;
+      avgG = (avgG * 13.0 + g) / 14.0;
+      avgL = (avgL * 13.0 + l) / 14.0;
+      rsi[i] = avgL === 0 ? 100.0 : 100.0 - (100.0 / (1.0 + avgG / avgL));
+    }}
+  }}
+
+  // 5. MACD UMWA (12, 26, 9)
+  const ema12 = computeEmaWithSeed(closes, 12, closes[0]);
+  const ema26 = computeEmaWithSeed(closes, 26, closes[0]);
+  const macdLine = closes.map((_, i) => ema12[i] - ema26[i]);
+  const sigLine = computeEmaWithSeed(macdLine, 9, macdLine[0]);
+  const macdHist = macdLine.map((v, i) => v - sigLine[i]);
+
+  const startIdx = Math.max(0, total - chartBarsCount);
+  return {{
+    sym,
+    meta: d,
+    dates: dates.slice(startIdx),
+    opens: opens.slice(startIdx),
+    highs: highs.slice(startIdx),
+    lows: lows.slice(startIdx),
+    closes: closes.slice(startIdx),
+    bbMid: bbMid.slice(startIdx),
+    bbUpper: bbUpper.slice(startIdx),
+    bbLower: bbLower.slice(startIdx),
+    ema20: ema20.slice(startIdx),
+    ema50: ema50.slice(startIdx),
+    ema100: ema100.slice(startIdx),
+    ema200: ema200.slice(startIdx),
+    stShortK: stShort.k.slice(startIdx),
+    stShortD: stShort.d.slice(startIdx),
+    stLongK: stLong.k.slice(startIdx),
+    stLongD: stLong.d.slice(startIdx),
+    rsi: rsi.slice(startIdx),
+    macdHist: macdHist.slice(startIdx),
+  }};
+}}
+
+function selectChartSymbol(sym) {{
+  if (!CHART_DATA[sym]) return;
+  activeChartSym = sym;
+  hoverBarIdx = null;
+  cachedChartCalc = computeUmwaSeries(sym);
+
+  document.querySelectorAll('#tvWlList .tv-wl-row').forEach(r => {{
+    r.classList.toggle('active', r.getAttribute('data-wlsym') === sym);
+  }});
+
+  const d = CHART_DATA[sym];
+  document.getElementById('tvSymTitle').textContent = sym;
+  document.getElementById('tvCompName').textContent = (d.n || sym) + ' · 1D';
+  document.getElementById('tvCatBadge').textContent = d.cat || '';
+  document.getElementById('tvExtLink').href = 'https://de.tradingview.com/chart/?symbol=' + encodeURIComponent(sym);
+
+  const sigEl = document.getElementById('tvSigBadge');
+  if (d.lvl === 'STRONG_BUY') {{
+    sigEl.className = 'sig-badge sig-strong-buy';
+    sigEl.textContent = 'KAUFSIGNAL (' + d.bull + '/4) · SHORT PUT';
+  }} else if (d.lvl === 'STRONG_SELL') {{
+    sigEl.className = 'sig-badge sig-strong-sell';
+    sigEl.textContent = 'VERKAUFSSIGNAL (' + d.bear + '/4) · SHORT CALL';
+  }} else if (d.lvl === 'WEAK_BUY') {{
+    sigEl.className = 'sig-badge sig-weak-buy';
+    sigEl.textContent = 'WATCH LONG (2/4)';
+  }} else if (d.lvl === 'WEAK_SELL') {{
+    sigEl.className = 'sig-badge sig-weak-sell';
+    sigEl.textContent = 'WATCH SHORT (2/4)';
+  }} else {{
+    sigEl.className = 'sig-badge sig-neutral';
+    sigEl.textContent = 'NEUTRAL (' + d.bull + 'B/' + d.bear + 'S)';
+  }}
+
+  // Bottom Cards aktualisieren
+  const ind = d.ind || {{}};
+  const pill = (lbl, v) => {{
+    const cls = v > 0 ? 'ind-bull' : (v < 0 ? 'ind-bear' : 'ind-neut');
+    const ic = v > 0 ? '▲' : (v < 0 ? '▼' : '·');
+    return '<span class="mono ind-pill ' + cls + '" style="margin-right:4px">' + lbl + ' ' + ic + '</span>';
+  }};
+  const rsnHtml = (d.rsn && d.rsn.length)
+    ? d.rsn.map(x => '<div style="font-size:11px;color:var(--txt-secondary);margin-top:3px">• ' + x + '</div>').join('')
+    : '<div style="font-size:11px;color:var(--txt-muted);margin-top:4px">Keine extremen Umkehr-Trigger am aktuellen Tag.</div>';
+  document.getElementById('tvCardInd').innerHTML = '<div style="margin-bottom:6px">' +
+    pill('BB', ind.bb) + pill('RSI', ind.rsi) + pill('MACD', ind.macd) + pill('STOCH', ind.stoch) + '</div>' + rsnHtml;
+
+  const supHtml = (d.sup || []).map(s =>
+    '<div class="mono" style="font-size:11.5px;color:#60a5fa;margin-bottom:3px">🔵 <b>SUP ' + s.p.toFixed(2) + ' $</b> (' + (s.d >= 0 ? '+' : '') + s.d.toFixed(1) + '% · ' + s.b + 'x Touch / ' + s.v + ' Pivots)</div>'
+  ).join('');
+  const resHtml = (d.res || []).map(r =>
+    '<div class="mono" style="font-size:11.5px;color:#38bdf8;margin-bottom:3px">🔵 <b>RES ' + r.p.toFixed(2) + ' $</b> (+' + r.d.toFixed(1) + '% · ' + r.b + 'x Touch / ' + r.v + ' Pivots)</div>'
+  ).join('');
+  document.getElementById('tvCardSR').innerHTML = (supHtml || resHtml) ? (supHtml + resHtml) : '<div class="txt-muted">Keine validierte horizontale Linie im nahen Radius.</div>';
+
+  if (d.opt && d.opt.q) {{
+    const shBadge = d.opt.sh ? '<div style="color:var(--emerald);font-weight:700;font-size:11px;margin-top:4px">🛡️ GESCHÜTZT durch S/R-Linie</div>' : '';
+    document.getElementById('tvCardOpt').innerHTML =
+      '<div class="mono" style="font-size:12px;font-weight:700;color:var(--txt-primary)">' + (d.opt.con || d.opt.t) + '</div>' +
+      '<div class="mono" style="font-size:11.5px;color:var(--txt-secondary);margin-top:3px">Strike: <b>' + d.opt.k.toFixed(2) + ' $</b> (OTM ' + d.opt.otm.toFixed(1) + '%) · Δ ' + d.opt.d.toFixed(2) + '</div>' +
+      '<div class="mono" style="font-size:11.5px;color:var(--emerald);font-weight:700;margin-top:2px">Prämie: +' + d.opt.p.toFixed(2) + ' $ (+' + d.opt.pr.toFixed(2) + '%)</div>' + shBadge;
+  }} else if (d.opt) {{
+    document.getElementById('tvCardOpt').innerHTML = '<div class="txt-muted" style="font-size:11.5px">' + (d.opt.note || 'Kein qualifizierter Weekly-Strike') + '</div>';
+  }} else {{
+    document.getElementById('tvCardOpt').innerHTML = '<div class="txt-muted" style="font-size:11.5px">Kein aktives Options-Signal.</div>';
+  }}
+
+  const ew = d.ew || {{}};
+  document.getElementById('tvCardEW').innerHTML =
+    '<div style="font-weight:700;color:var(--txt-primary);font-size:11.5px">' + (ew.w ? '[' + ew.w + '] ' : '') + (ew.ph || 'Neutral') + ' (' + (ew.pr || 50) + '%)</div>' +
+    '<div style="font-size:11px;color:var(--txt-secondary);margin-top:2px">' + (ew.sc || '') + '</div>' +
+    '<div class="mono" style="font-size:11px;color:var(--sky);margin-top:5px">Fundamental: <b>' + (d.fl || '') + ' (' + (d.fs || 0) + '/100)</b></div>';
+
+  drawUmwaChart();
+}}
+
+function drawUmwaChart() {{
+  const canvas = document.getElementById('umwaChartCanvas');
+  if (!canvas || !cachedChartCalc) return;
+  const rect = canvas.parentElement.getBoundingClientRect();
+  if (rect.width < 50 || rect.height < 50) return;
+
+  const dpr = window.devicePixelRatio || 2;
+  canvas.width = Math.floor(rect.width * dpr);
+  canvas.height = Math.floor(rect.height * dpr);
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+
+  const W = rect.width;
+  const H = rect.height;
+  const axisW = 76;
+  const timeH = 24;
+  const plotW = W - axisW;
+  const plotH = H - timeH;
+
+  // 4 Panes wie in TradingView ("Julian Layout")
+  const p1Top = 0, p1H = Math.floor(plotH * 0.50);
+  const p2Top = p1H, p2H = Math.floor(plotH * 0.17);
+  const p3Top = p2Top + p2H, p3H = Math.floor(plotH * 0.16);
+  const p4Top = p3Top + p3H, p4H = plotH - p4Top;
+
+  const c = cachedChartCalc;
+  const n = c.closes.length;
+  if (!n) return;
+  const idx = (hoverBarIdx != null && hoverBarIdx >= 0 && hoverBarIdx < n) ? hoverBarIdx : (n - 1);
+
+  // OHLC Header-Leiste aktualisieren
+  const ohlcEl = document.getElementById('tvOhlcBar');
+  if (ohlcEl) {{
+    const prevC = idx > 0 ? c.closes[idx - 1] : c.opens[idx];
+    const diff = c.closes[idx] - prevC;
+    const pct = prevC > 0 ? (diff / prevC) * 100.0 : 0.0;
+    const clr = diff >= 0 ? 'var(--emerald)' : 'var(--rose)';
+    const sign = diff >= 0 ? '+' : '';
+    ohlcEl.innerHTML =
+      '<span><b>' + c.dates[idx] + '</b></span>' +
+      '<span>O <b style="color:' + clr + '">' + c.opens[idx].toFixed(2) + '</b></span>' +
+      '<span>H <b style="color:' + clr + '">' + c.highs[idx].toFixed(2) + '</b></span>' +
+      '<span>L <b style="color:' + clr + '">' + c.lows[idx].toFixed(2) + '</b></span>' +
+      '<span>C <b style="color:' + clr + '">' + c.closes[idx].toFixed(2) + '</b></span>' +
+      '<span style="color:' + clr + ';font-weight:700">' + sign + diff.toFixed(2) + ' (' + sign + pct.toFixed(2) + '%)</span>';
+  }}
+
+  // Hintergrund
+  ctx.fillStyle = '#090d14';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#0d131f';
+  ctx.fillRect(plotW, 0, axisW, H);
+
+  const xOf = (i) => 8 + ((i + 0.5) / n) * (plotW - 16);
+  const barW = Math.max(1.5, Math.min(9.0, ((plotW - 16) / n) * 0.72));
+
+  // ===================================================================
+  // PANE 1: PREIS + BB & EMAs + BLAUE S/R-LINIEN + OPTIONS-STRIKE
+  // ===================================================================
+  let minP = Infinity, maxP = -Infinity;
+  for (let i = 0; i < n; i++) {{
+    if (c.lows[i] < minP) minP = c.lows[i];
+    if (c.highs[i] > maxP) maxP = c.highs[i];
+    if (chartLayers.bb && c.bbUpper[i] != null) {{
+      if (c.bbLower[i] < minP) minP = c.bbLower[i];
+      if (c.bbUpper[i] > maxP) maxP = c.bbUpper[i];
+    }}
+  }}
+  // Beziehe nahe S/R-Linien & Options-Strike in die Y-Skala ein, damit man die Schutzmauer immer im Bild sieht
+  const midVis = (minP + maxP) * 0.5;
+  const spanVis = Math.max(maxP - minP, midVis * 0.05);
+  if (chartLayers.sr) {{
+    (c.meta.sup || []).forEach(s => {{
+      if (s.p >= minP - spanVis * 0.35 && s.p <= maxP + spanVis * 0.2) {{
+        if (s.p < minP) minP = s.p;
+        if (s.p > maxP) maxP = s.p;
+      }}
+    }});
+    (c.meta.res || []).forEach(r => {{
+      if (r.p >= minP - spanVis * 0.2 && r.p <= maxP + spanVis * 0.35) {{
+        if (r.p < minP) minP = r.p;
+        if (r.p > maxP) maxP = r.p;
+      }}
+    }});
+  }}
+  if (chartLayers.opt && c.meta.opt && c.meta.opt.k) {{
+    const ok = c.meta.opt.k;
+    if (ok >= minP - spanVis * 0.45 && ok <= maxP + spanVis * 0.45) {{
+      if (ok < minP) minP = ok;
+      if (ok > maxP) maxP = ok;
+    }}
+  }}
+  const padP = (maxP - minP) * 0.075 || 1.0;
+  minP -= padP; maxP += padP;
+  const yOfP1 = (val) => p1Top + 12 + (1.0 - (val - minP) / (maxP - minP)) * (p1H - 24);
+
+  // Horizontales Preis-Gitter
+  ctx.strokeStyle = 'rgba(30, 41, 59, 0.55)';
+  ctx.lineWidth = 1;
+  ctx.font = '10.5px "SF Mono", Menlo, monospace';
+  const stepsP1 = 6;
+  for (let s = 0; s <= stepsP1; s++) {{
+    const val = minP + (s / stepsP1) * (maxP - minP);
+    const y = yOfP1(val);
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
+    ctx.fillStyle = '#64748b';
+    ctx.fillText(val.toFixed(2), plotW + 6, y + 3.5);
+  }}
+
+  // Vertikales Monats-Gitter + Monatsnamen unten
+  const monthNames = ['Jan', 'Feb', 'Mär', 'Apr', 'Mai', 'Jun', 'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Dez'];
+  let lastMonth = '';
+  for (let i = 0; i < n; i++) {{
+    const ym = c.dates[i].slice(0, 7);
+    if (ym !== lastMonth) {{
+      lastMonth = ym;
+      const x = xOf(i);
+      ctx.strokeStyle = 'rgba(30, 41, 59, 0.42)';
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, plotH); ctx.stroke();
+      if (x > 28 && x < plotW - 30) {{
+        const mNum = parseInt(c.dates[i].slice(5, 7), 10) - 1;
+        const yr = c.dates[i].slice(2, 4);
+        const lbl = (mNum === 0) ? (monthNames[mNum] + " '" + yr) : monthNames[mNum];
+        ctx.fillStyle = '#64748b';
+        ctx.fillText(lbl, x - 12, plotH + 16);
+      }}
+    }}
+  }}
+
+  const drawCurve = (arr, yFn, color, width, dashed = false) => {{
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    if (dashed) ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < n; i++) {{
+      if (arr[i] == null) continue;
+      const x = xOf(i), y = yFn(arr[i]);
+      if (!started) {{ ctx.moveTo(x, y); started = true; }}
+      else ctx.lineTo(x, y);
+    }}
+    ctx.stroke();
+    ctx.restore();
+  }};
+
+  const drawAxisTag = (y, topB, botB, text, bg, fg = '#fff') => {{
+    if (y < topB + 6 || y > botB - 6) return;
+    ctx.fillStyle = bg;
+    ctx.fillRect(plotW + 1, y - 8, axisW - 2, 16);
+    ctx.fillStyle = fg;
+    ctx.font = 'bold 10px "SF Mono", Menlo, monospace';
+    ctx.fillText(text, plotW + 5, y + 3.5);
+  }};
+
+  // 1a. Bollinger Bänder (20, 2.0) wie im TradingView-Screenshot (türkises Band + Füllung)
+  if (chartLayers.bb) {{
+    ctx.save();
+    ctx.fillStyle = 'rgba(34, 211, 238, 0.055)';
+    ctx.beginPath();
+    let firstIdx = -1;
+    for (let i = 0; i < n; i++) {{
+      if (c.bbUpper[i] != null) {{
+        const x = xOf(i), y = yOfP1(c.bbUpper[i]);
+        if (firstIdx < 0) {{ firstIdx = i; ctx.moveTo(x, y); }}
+        else ctx.lineTo(x, y);
+      }}
+    }}
+    if (firstIdx >= 0) {{
+      for (let i = n - 1; i >= firstIdx; i--) {{
+        if (c.bbLower[i] != null) ctx.lineTo(xOf(i), yOfP1(c.bbLower[i]));
+      }}
+      ctx.closePath();
+      ctx.fill();
+    }}
+    ctx.restore();
+    drawCurve(c.bbUpper, yOfP1, 'rgba(34, 211, 238, 0.78)', 1.2);
+    drawCurve(c.bbLower, yOfP1, 'rgba(34, 211, 238, 0.78)', 1.2);
+    drawCurve(c.bbMid, yOfP1, 'rgba(56, 189, 248, 0.55)', 1.1, true);
+  }}
+
+  // 1b. EMAs (20 Gelb, 50 Rot/Pink, 100 Blau, 200 Magenta - exakt wie im Screenshot "BB & EMAs")
+  if (chartLayers.ema) {{
+    drawCurve(c.ema200, yOfP1, '#d946ef', 1.4);
+    drawCurve(c.ema100, yOfP1, '#3b82f6', 1.3);
+    drawCurve(c.ema50, yOfP1, '#f43f5e', 1.3);
+    drawCurve(c.ema20, yOfP1, '#facc15', 1.4);
+  }}
+
+  // 1c. Horizontale Support- & Widerstandslinien (Blaue Linien aus TradingView!)
+  if (chartLayers.sr) {{
+    (c.meta.sup || []).forEach((s, sIdx) => {{
+      const y = yOfP1(s.p);
+      if (y >= p1Top + 4 && y <= p1Top + p1H - 4) {{
+        ctx.save();
+        ctx.strokeStyle = sIdx === 0 ? '#2563eb' : 'rgba(59, 130, 246, 0.75)';
+        ctx.lineWidth = sIdx === 0 ? 2.0 : 1.4;
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
+        const lbl = '🔵 SUP ' + s.p.toFixed(2) + '$ (' + s.b + 'T/' + s.v + 'P)';
+        ctx.font = 'bold 10px "SF Mono", Menlo, monospace';
+        const tw = ctx.measureText(lbl).width + 10;
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.86)';
+        ctx.fillRect(10, y - 15, tw, 14);
+        ctx.fillStyle = '#60a5fa';
+        ctx.fillText(lbl, 15, y - 4.5);
+        ctx.restore();
+        drawAxisTag(y, p1Top, p1Top + p1H, s.p.toFixed(2), '#1d4ed8', '#ffffff');
+      }}
+    }});
+    (c.meta.res || []).forEach((r, rIdx) => {{
+      const y = yOfP1(r.p);
+      if (y >= p1Top + 4 && y <= p1Top + p1H - 4) {{
+        ctx.save();
+        ctx.strokeStyle = rIdx === 0 ? '#0284c7' : 'rgba(56, 189, 248, 0.65)';
+        ctx.lineWidth = rIdx === 0 ? 1.8 : 1.3;
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
+        const lbl = '🔵 RES ' + r.p.toFixed(2) + '$ (' + r.b + 'T/' + r.v + 'P)';
+        ctx.font = 'bold 10px "SF Mono", Menlo, monospace';
+        const tw = ctx.measureText(lbl).width + 10;
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.86)';
+        ctx.fillRect(10, y + 2, tw, 14);
+        ctx.fillStyle = '#38bdf8';
+        ctx.fillText(lbl, 15, y + 12.5);
+        ctx.restore();
+        drawAxisTag(y, p1Top, p1Top + p1H, r.p.toFixed(2), '#0369a1', '#ffffff');
+      }}
+    }});
+  }}
+
+  // 1d. Weekly Stillhalter Options-Strike-Linie (🛡️)
+  if (chartLayers.opt && c.meta.opt && c.meta.opt.k) {{
+    const opt = c.meta.opt;
+    const y = yOfP1(opt.k);
+    if (y >= p1Top + 4 && y <= p1Top + p1H - 4) {{
+      const isPut = (opt.t || '').includes('PUT');
+      const clr = isPut ? '#10b981' : '#f43f5e';
+      ctx.save();
+      ctx.strokeStyle = clr;
+      ctx.lineWidth = 1.6;
+      ctx.setLineDash([6, 4]);
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
+      const lbl = (opt.sh ? '🛡️ ' : '') + opt.t + ' STRIKE ' + opt.k.toFixed(2) + '$ (Δ ' + (opt.d || 0).toFixed(2) + ' · +' + (opt.pr || 0).toFixed(2) + '%)';
+      ctx.font = 'bold 10px "SF Mono", Menlo, monospace';
+      const tw = ctx.measureText(lbl).width + 10;
+      ctx.fillStyle = 'rgba(6, 78, 59, 0.88)';
+      ctx.fillRect(plotW - tw - 12, y - 15, tw, 14);
+      ctx.fillStyle = '#6ee7b7';
+      ctx.fillText(lbl, plotW - tw - 7, y - 4.5);
+      ctx.restore();
+      drawAxisTag(y, p1Top, p1Top + p1H, opt.k.toFixed(2), '#059669', '#ffffff');
+    }}
+  }}
+
+  // 1e. Candlesticks (1 Jahr Tageskerzen)
+  for (let i = 0; i < n; i++) {{
+    const x = xOf(i);
+    const o = c.opens[i], h = c.highs[i], l = c.lows[i], cl = c.closes[i];
+    const isBull = cl >= o;
+    const clr = isBull ? '#10b981' : '#f43f5e';
+    ctx.strokeStyle = clr;
+    ctx.lineWidth = 1.15;
+    ctx.beginPath();
+    ctx.moveTo(x, yOfP1(h));
+    ctx.lineTo(x, yOfP1(l));
+    ctx.stroke();
+
+    const yTop = yOfP1(Math.max(o, cl));
+    const yBot = yOfP1(Math.min(o, cl));
+    const bh = Math.max(1.5, yBot - yTop);
+    ctx.fillStyle = clr;
+    ctx.fillRect(x - barW * 0.5, yTop, barW, bh);
+  }}
+
+  // Aktuelle Schlusskurs-Linie + Tag rechts
+  const lastC = c.closes[n - 1];
+  const lastOpen = c.opens[n - 1];
+  const yLast = yOfP1(lastC);
+  ctx.save();
+  ctx.strokeStyle = lastC >= lastOpen ? 'rgba(16, 185, 129, 0.5)' : 'rgba(244, 63, 94, 0.5)';
+  ctx.setLineDash([2, 2]);
+  ctx.beginPath(); ctx.moveTo(0, yLast); ctx.lineTo(plotW, yLast); ctx.stroke();
+  ctx.restore();
+  drawAxisTag(yLast, p1Top, p1Top + p1H, lastC.toFixed(2), lastC >= lastOpen ? '#10b981' : '#f43f5e', '#04130d');
+
+  // Top-Left Legende Pane 1 (wie TradingView "BB & EMAs")
+  ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, "SF Mono", monospace';
+  let lx = 10, ly = p1Top + 16;
+  ctx.fillStyle = '#94a3b8';
+  ctx.fillText('BB & EMAs', lx, ly); lx += 68;
+  const drawLegVal = (val, clr) => {{
+    if (val == null) return;
+    const s = val.toFixed(2);
+    ctx.fillStyle = clr;
+    ctx.fillText(s, lx, ly);
+    lx += ctx.measureText(s).width + 8;
+  }};
+  drawLegVal(c.bbMid[idx], '#38bdf8');
+  drawLegVal(c.bbUpper[idx], '#22d3ee');
+  drawLegVal(c.bbLower[idx], '#22d3ee');
+  drawLegVal(c.ema20[idx], '#facc15');
+  drawLegVal(c.ema50[idx], '#f43f5e');
+  drawLegVal(c.ema100[idx], '#3b82f6');
+  drawLegVal(c.ema200[idx], '#d946ef');
+
+  // ===================================================================
+  // PANE 2: STOCHASTIK UMWA (DUAL: KURZ 14,5,3 & LANG 50,6,5)
+  // ===================================================================
+  ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.moveTo(0, p2Top); ctx.lineTo(W, p2Top); ctx.stroke();
+
+  const yOfP2 = (v) => p2Top + 8 + (1.0 - v / 100.0) * (p2H - 16);
+  ctx.fillStyle = 'rgba(30, 41, 59, 0.22)';
+  ctx.fillRect(0, yOfP2(80), plotW, yOfP2(20) - yOfP2(80));
+  [80, 50, 20].forEach(lvl => {{
+    const y = yOfP2(lvl);
+    ctx.strokeStyle = lvl === 50 ? 'rgba(51, 65, 85, 0.4)' : 'rgba(100, 116, 139, 0.45)';
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
+    ctx.fillStyle = '#64748b'; ctx.font = '10px "SF Mono", monospace';
+    ctx.fillText(lvl.toFixed(0), plotW + 6, y + 3);
+  }});
+
+  drawCurve(c.stLongD, yOfP2, '#3b82f6', 1.35);
+  drawCurve(c.stLongK, yOfP2, '#22c55e', 1.45);
+  drawCurve(c.stShortD, yOfP2, '#38bdf8', 1.25);
+  drawCurve(c.stShortK, yOfP2, '#ef4444', 1.55);
+
+  if (c.stLongK[n - 1] != null) drawAxisTag(yOfP2(c.stLongK[n - 1]), p2Top, p2Top + p2H, c.stLongK[n - 1].toFixed(1), '#16a34a');
+  if (c.stShortK[n - 1] != null) drawAxisTag(yOfP2(c.stShortK[n - 1]), p2Top, p2Top + p2H, c.stShortK[n - 1].toFixed(1), '#dc2626');
+
+  lx = 10; ly = p2Top + 15;
+  ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, "SF Mono", monospace';
+  ctx.fillStyle = '#94a3b8';
+  ctx.fillText('Stochastik UMWA', lx, ly); lx += 106;
+  drawLegVal(c.stShortK[idx], '#ef4444');
+  drawLegVal(c.stShortD[idx], '#38bdf8');
+  drawLegVal(c.stLongK[idx], '#22c55e');
+  drawLegVal(c.stLongD[idx], '#3b82f6');
+
+  // ===================================================================
+  // PANE 3: RSI UMWA (14)
+  // ===================================================================
+  ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.moveTo(0, p3Top); ctx.lineTo(W, p3Top); ctx.stroke();
+
+  const yOfP3 = (v) => p3Top + 8 + (1.0 - (v - 10.0) / 80.0) * (p3H - 16);
+  ctx.fillStyle = 'rgba(168, 85, 247, 0.05)';
+  ctx.fillRect(0, yOfP3(70), plotW, yOfP3(30) - yOfP3(70));
+
+  const yRsi70 = yOfP3(70), yRsi30 = yOfP3(30);
+  ctx.strokeStyle = 'rgba(16, 185, 129, 0.55)';
+  ctx.beginPath(); ctx.moveTo(0, yRsi70); ctx.lineTo(plotW, yRsi70); ctx.stroke();
+  ctx.strokeStyle = 'rgba(244, 63, 94, 0.55)';
+  ctx.beginPath(); ctx.moveTo(0, yRsi30); ctx.lineTo(plotW, yRsi30); ctx.stroke();
+  ctx.fillStyle = '#64748b'; ctx.font = '10px "SF Mono", monospace';
+  ctx.fillText('70', plotW + 6, yRsi70 + 3);
+  ctx.fillText('30', plotW + 6, yRsi30 + 3);
+
+  drawCurve(c.rsi, yOfP3, '#d946ef', 1.75);
+  if (c.rsi[n - 1] != null) drawAxisTag(yOfP3(c.rsi[n - 1]), p3Top, p3Top + p3H, c.rsi[n - 1].toFixed(2), '#c026d3');
+
+  lx = 10; ly = p3Top + 15;
+  ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, "SF Mono", monospace';
+  ctx.fillStyle = '#94a3b8';
+  ctx.fillText('RSI UMWA', lx, ly); lx += 68;
+  drawLegVal(c.rsi[idx], '#d946ef');
+
+  // ===================================================================
+  // PANE 4: MACD UMWA (12, 26, 9 HISTOGRAMM)
+  // ===================================================================
+  ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.moveTo(0, p4Top); ctx.lineTo(W, p4Top); ctx.stroke();
+
+  let maxM = 0.001;
+  for (let i = 0; i < n; i++) {{
+    if (c.macdHist[i] != null && Math.abs(c.macdHist[i]) > maxM) maxM = Math.abs(c.macdHist[i]);
+  }}
+  maxM *= 1.15;
+  const yOfP4 = (v) => p4Top + 8 + (0.5 - (v / (2.0 * maxM))) * (p4H - 16);
+  const yZero = yOfP4(0);
+  ctx.strokeStyle = 'rgba(100, 116, 139, 0.45)';
+  ctx.beginPath(); ctx.moveTo(0, yZero); ctx.lineTo(plotW, yZero); ctx.stroke();
+
+  for (let i = 0; i < n; i++) {{
+    const v = c.macdHist[i];
+    if (v == null) continue;
+    const prevV = i > 0 && c.macdHist[i - 1] != null ? c.macdHist[i - 1] : 0;
+    let mClr = '#22c55e';
+    if (v >= 0) mClr = (v >= prevV) ? '#22c55e' : '#86efac';
+    else mClr = (v <= prevV) ? '#ef4444' : '#fca5a5';
+    const x = xOf(i);
+    const y = yOfP4(v);
+    ctx.fillStyle = mClr;
+    ctx.fillRect(x - barW * 0.45, Math.min(y, yZero), Math.max(1.2, barW * 0.9), Math.max(1.0, Math.abs(y - yZero)));
+  }}
+  const lastM = c.macdHist[n - 1];
+  if (lastM != null) {{
+    drawAxisTag(yOfP4(lastM), p4Top, p4Top + p4H, lastM.toFixed(4), lastM >= 0 ? '#16a34a' : '#dc2626');
+  }}
+
+  lx = 10; ly = p4Top + 15;
+  ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, "SF Mono", monospace';
+  ctx.fillStyle = '#94a3b8';
+  ctx.fillText('MACD UMWA', lx, ly); lx += 82;
+  if (c.macdHist[idx] != null) {{
+    ctx.fillStyle = c.macdHist[idx] >= 0 ? '#22c55e' : '#f43f5e';
+    ctx.fillText(c.macdHist[idx].toFixed(4), lx, ly);
+  }}
+
+  // Untere Zeitachsen-Trennlinie & rechte Achsen-Trennlinie
+  ctx.strokeStyle = '#1e293b';
+  ctx.beginPath();
+  ctx.moveTo(0, plotH); ctx.lineTo(W, plotH);
+  ctx.moveTo(plotW, 0); ctx.lineTo(plotW, H);
+  ctx.stroke();
+
+  // Synchronisiertes Fadenkreuz (Crosshair)
+  if (hoverBarIdx != null && hoverBarIdx >= 0 && hoverBarIdx < n) {{
+    const cx = xOf(hoverBarIdx);
+    ctx.save();
+    ctx.strokeStyle = 'rgba(148, 163, 184, 0.55)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, plotH); ctx.stroke();
+    ctx.restore();
+
+    const dtStr = c.dates[hoverBarIdx];
+    ctx.font = 'bold 10.5px "SF Mono", monospace';
+    const dw = ctx.measureText(dtStr).width + 14;
+    const dx = Math.max(4, Math.min(plotW - dw - 4, cx - dw * 0.5));
+    ctx.fillStyle = '#1e293b';
+    ctx.fillRect(dx, plotH + 3, dw, 18);
+    ctx.fillStyle = '#f8fafc';
+    ctx.fillText(dtStr, dx + 7, plotH + 15.5);
+  }}
+}}
+
+// Interaktive Maus- & Touch-Steuerung für das 4-Pane-Chart + Pfeiltasten für Watchlist
+(function initChartInteractions() {{
+  const canvas = document.getElementById('umwaChartCanvas');
+  if (!canvas) return;
+
+  const updateHoverFromClientX = (clientX) => {{
+    if (!cachedChartCalc) return;
+    const rect = canvas.getBoundingClientRect();
+    const plotW = rect.width - 76;
+    const relX = clientX - rect.left;
+    if (relX < 0 || relX > plotW) {{
+      hoverBarIdx = null;
+      drawUmwaChart();
+      return;
+    }}
+    const n = cachedChartCalc.closes.length;
+    const idx = Math.max(0, Math.min(n - 1, Math.floor(((relX - 8) / (plotW - 16)) * n)));
+    if (idx !== hoverBarIdx) {{
+      hoverBarIdx = idx;
+      drawUmwaChart();
+    }}
+  }};
+
+  canvas.addEventListener('mousemove', e => updateHoverFromClientX(e.clientX));
+  canvas.addEventListener('mouseleave', () => {{ hoverBarIdx = null; drawUmwaChart(); }});
+  canvas.addEventListener('touchstart', e => {{
+    if (e.touches && e.touches[0]) updateHoverFromClientX(e.touches[0].clientX);
+  }}, {{ passive: true }});
+  canvas.addEventListener('touchmove', e => {{
+    if (e.touches && e.touches[0]) updateHoverFromClientX(e.touches[0].clientX);
+  }}, {{ passive: true }});
+
+  window.addEventListener('resize', () => {{
+    if (document.getElementById('view-charts').style.display !== 'none') drawUmwaChart();
+  }});
+
+  window.addEventListener('keydown', e => {{
+    if (document.getElementById('view-charts').style.display === 'none') return;
+    if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {{
+      e.preventDefault();
+      const syms = getFilteredChartSymbols();
+      if (!syms.length) return;
+      const cur = syms.indexOf(activeChartSym);
+      const next = e.key === 'ArrowDown'
+        ? syms[(cur + 1) % syms.length]
+        : syms[(cur - 1 + syms.length) % syms.length];
+      selectChartSymbol(next);
+      const activeRow = document.querySelector('#tvWlList .tv-wl-row.active');
+      if (activeRow) activeRow.scrollIntoView({{ block: 'nearest' }});
+    }}
+  }});
+}})();
 
 applyAllFilters();
 (async function checkInitialRefresh() {{
