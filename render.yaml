@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: market-vision-pro-v1
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 server_v1.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.8
+      - key: EODHD_API_KEY
+        value: 690cc04fad1308.55079017
