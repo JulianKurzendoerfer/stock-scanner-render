@@ -28,7 +28,7 @@ ASSETS_DIR = BASE_DIR / "assets"
 PORT = int(os.environ.get("PORT", os.environ.get("V1_PORT", "8765")))
 
 TUNNEL_PROC = None
-PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL") or None
+PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL") or "https://version-1-umwa.onrender.com"
 REFRESH_LOCK = threading.Lock()
 IS_REFRESHING = False
 LAST_REFRESH_OK = True

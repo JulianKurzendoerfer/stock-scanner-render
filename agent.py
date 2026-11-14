@@ -3415,21 +3415,20 @@ async function openShareModal() {{
   document.getElementById('shareModal').classList.add('open');
   const box = document.getElementById('serverUrlBox');
   const qrWrap = document.getElementById('qrWrap');
+  const renderUrl = 'https://version-1-umwa.onrender.com';
+  box.innerHTML = '🌐 <b>24/7 Render Cloud-App aktiv!</b> Überall auf iPad &amp; Handy nutzbar (auch wenn dein Mac aus ist):';
+  document.getElementById('shareLinkInput').value = renderUrl;
+  document.getElementById('qrImg').src = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(renderUrl);
+  qrWrap.style.display = 'flex';
   try {{
     const r = await fetch('/api/status');
     if (r.ok) {{
       const d = await r.json();
-      const url = d.public_url || d.lan_url || window.location.href;
-      box.innerHTML = d.public_url
-        ? '🌐 <b>Öffentlicher Bruder-Link aktiv!</b> Überall auf iPad &amp; Handy nutzbar:'
-        : '📶 <b>WLAN-Live-Server aktiv!</b> Im selben WLAN sofort auf iPad &amp; Handy öffnen (oder unten öffentlichen Link für deinen Bruder aktivieren):';
+      const url = d.public_url || renderUrl;
       document.getElementById('shareLinkInput').value = url;
       document.getElementById('qrImg').src = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(url);
-      qrWrap.style.display = 'flex';
-      return;
     }}
   }} catch (e) {{}}
-  box.innerHTML = 'Du nutzt gerade die eigenständige App-Datei. Nutze oben <b>Weg 1 (AirDrop / WhatsApp / Teilen)</b> oder starte <b>Version 1.app</b> auf dem Mac für den Live-WLAN- &amp; Cloud-Server.';
 }}
 
 function closeShareModal() {{

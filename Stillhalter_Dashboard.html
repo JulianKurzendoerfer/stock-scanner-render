@@ -805,7 +805,11 @@ async function openShareModal() {
       return;
     }
   } catch (e) {}
-  box.innerHTML = 'Du nutzt gerade die eigenständige App-Datei. Nutze oben <b>Weg 1 (AirDrop / WhatsApp / Teilen)</b> oder starte <b>Version 1.app</b> auf dem Mac für den Live-WLAN- &amp; Cloud-Server.';
+  const renderUrl = 'https://version-1-umwa.onrender.com';
+  box.innerHTML = '🌐 <b>24/7 Render Cloud-App aktiv!</b> Überall auf iPad &amp; Handy nutzbar (auch wenn dein Mac aus ist):';
+  document.getElementById('shareLinkInput').value = renderUrl;
+  document.getElementById('qrImg').src = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(renderUrl);
+  qrWrap.style.display = 'flex';
 }
 
 function closeShareModal() {
