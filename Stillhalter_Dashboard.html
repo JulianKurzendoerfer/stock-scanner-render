@@ -770,21 +770,54 @@ function sortTable(key) {
   rows.forEach(r => tbody.appendChild(r));
 }
 
+async function resolveApiBase() {
+  if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
+    return '';
+  }
+  try {
+    const r = await fetch('http://localhost:8765/api/status');
+    if (r.ok) return 'http://localhost:8765';
+  } catch (e) {}
+  return 'https://version-1-umwa.onrender.com';
+}
+
+async function pollRefreshStatus(base, btn) {
+  btn.disabled = true;
+  const start = Date.now();
+  while (true) {
+    const sec = Math.max(1, Math.round((Date.now() - start) / 1000));
+    btn.innerHTML = '⏳ Scanne 255 Aktien (' + sec + 's)...';
+    await new Promise(r => setTimeout(r, 2000));
+    try {
+      const st = await fetch(base + '/api/status');
+      if (st.ok) {
+        const d = await st.json();
+        if (!d.refreshing) {
+          if (base === '') window.location.reload();
+          else window.location.href = base + '/';
+          return;
+        }
+      }
+    } catch (e) {}
+    if (sec > 180) break;
+  }
+  btn.innerHTML = '↻ Live-Update';
+  btn.disabled = false;
+}
+
 async function triggerLiveRefresh() {
   const btn = document.getElementById('refreshBtn');
-  const orig = btn.innerHTML;
-  btn.innerHTML = '⏳ Scanne 255 Aktien...';
+  btn.innerHTML = '⏳ Starte Live-Scan...';
   btn.disabled = true;
   try {
-    const res = await fetch('/api/refresh', { method: 'POST' });
+    const base = await resolveApiBase();
+    const res = await fetch(base + '/api/refresh', { method: 'POST' });
     if (res.ok) {
-      window.location.reload();
+      await pollRefreshStatus(base, btn);
       return;
     }
   } catch (e) {}
-  alert('Hinweis: Für einen kompletten Live-Scan auf Knopfdruck starte bitte "Version 1.app" auf deinem Mac. Die App aktualisiert dann alle 255 Aktien live.');
-  btn.innerHTML = orig;
-  btn.disabled = false;
+  window.location.href = 'https://version-1-umwa.onrender.com';
 }
 
 async function openShareModal() {
@@ -863,6 +896,19 @@ async function shareAppFile() {
 }
 
 applyAllFilters();
+(async function checkInitialRefresh() {
+  if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
+    try {
+      const r = await fetch('/api/status');
+      if (r.ok) {
+        const d = await r.json();
+        if (d.refreshing) {
+          pollRefreshStatus('', document.getElementById('refreshBtn'));
+        }
+      }
+    } catch (e) {}
+  }
+})();
 </script>
 </body>
 </html>

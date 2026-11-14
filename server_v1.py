@@ -32,6 +32,47 @@ PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL") or "https://version-1-umwa.on
 REFRESH_LOCK = threading.Lock()
 IS_REFRESHING = False
 LAST_REFRESH_OK = True
+LAST_REFRESH_TS = int(time.time())
+REFRESH_START_TS = 0
+
+
+def _run_refresh_worker():
+    global IS_REFRESHING, LAST_REFRESH_OK, LAST_REFRESH_TS, REFRESH_START_TS
+    with REFRESH_LOCK:
+        IS_REFRESHING = True
+        REFRESH_START_TS = int(time.time())
+        try:
+            python_bin = BASE_DIR / "venv" / "bin" / "python"
+            if not python_bin.exists():
+                python_bin = Path(sys.executable)
+            res = subprocess.run(
+                [str(python_bin), str(BASE_DIR / "agent.py"), "--only-signals", "--html"],
+                cwd=str(BASE_DIR),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            desktop_html = Path.home() / "Desktop" / "Version_1_App.html"
+            src_html = BASE_DIR / "Version_1_App.html"
+            if src_html.exists() and desktop_html.parent.exists():
+                try:
+                    desktop_html.write_bytes(src_html.read_bytes())
+                except Exception:
+                    pass
+            LAST_REFRESH_OK = (res.returncode == 0)
+            LAST_REFRESH_TS = int(time.time())
+        except Exception:
+            LAST_REFRESH_OK = False
+        finally:
+            IS_REFRESHING = False
+
+
+def trigger_async_refresh() -> bool:
+    if IS_REFRESHING:
+        return True
+    t = threading.Thread(target=_run_refresh_worker, daemon=True)
+    t.start()
+    return True
 
 
 def get_lan_ip() -> str:
@@ -206,12 +247,16 @@ class Version1Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/status":
             lan_ip = get_lan_ip()
             ext_url = os.environ.get("RENDER_EXTERNAL_URL") or PUBLIC_URL
+            elapsed = (int(time.time()) - REFRESH_START_TS) if IS_REFRESHING and REFRESH_START_TS else 0
             resp = {
                 "ok": True,
                 "version": "Version 1",
                 "lan_url": f"http://{lan_ip}:{PORT}",
                 "public_url": ext_url,
                 "refreshing": IS_REFRESHING,
+                "elapsed_sec": elapsed,
+                "last_refresh_ok": LAST_REFRESH_OK,
+                "last_refresh_ts": LAST_REFRESH_TS,
             }
             payload = json.dumps(resp).encode("utf-8")
             self.send_response(200)
@@ -227,31 +272,12 @@ class Version1Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
 
         if path == "/api/refresh":
-            with REFRESH_LOCK:
-                try:
-                    python_bin = BASE_DIR / "venv" / "bin" / "python"
-                    if not python_bin.exists():
-                        python_bin = Path(sys.executable)
-                    res = subprocess.run(
-                        [str(python_bin), str(BASE_DIR / "agent.py"), "--only-signals", "--html"],
-                        cwd=str(BASE_DIR),
-                        capture_output=True,
-                        text=True,
-                        timeout=300,
-                    )
-                    # Also copy updated Version_1_App.html to Desktop if Desktop exists
-                    desktop_html = Path.home() / "Desktop" / "Version_1_App.html"
-                    src_html = BASE_DIR / "Version_1_App.html"
-                    if src_html.exists() and desktop_html.parent.exists():
-                        try:
-                            desktop_html.write_bytes(src_html.read_bytes())
-                        except Exception:
-                            pass
-                    ok = res.returncode == 0
-                    payload = json.dumps({"ok": ok, "returncode": res.returncode}).encode("utf-8")
-                except Exception as e:
-                    payload = json.dumps({"ok": False, "error": str(e)}).encode("utf-8")
-
+            trigger_async_refresh()
+            payload = json.dumps({
+                "ok": True,
+                "refreshing": True,
+                "last_refresh_ts": LAST_REFRESH_TS,
+            }).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self._send_cors()
