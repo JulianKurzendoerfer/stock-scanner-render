@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.app/
+venv/
+.candle_cache_d.json
+.candle_cache_d.json.tmp

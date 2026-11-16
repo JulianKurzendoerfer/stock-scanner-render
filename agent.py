@@ -341,22 +341,77 @@ def fetch_candles_eodhd(symbol: str, api_key: str, period: str = "d", days: int 
     return candles
 
 
+import threading
+
+_CANDLE_CACHE_LOCK = threading.Lock()
+_CANDLE_CACHE_MEM: dict[str, list] = {}
+_CANDLE_CACHE_DIRTY = False
+_CANDLE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".candle_cache_d.json")
+
+
+def _load_candle_cache() -> None:
+    global _CANDLE_CACHE_MEM
+    if _CANDLE_CACHE_MEM or os.getenv("UMWA_FORCE_FRESH") == "1":
+        return
+    try:
+        if os.path.exists(_CANDLE_CACHE_FILE):
+            import time as _t
+            if (_t.time() - os.path.getmtime(_CANDLE_CACHE_FILE)) < 21600:  # 6h TTL
+                with open(_CANDLE_CACHE_FILE, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                if payload.get("date") == date.today().isoformat() and isinstance(payload.get("data"), dict):
+                    _CANDLE_CACHE_MEM = payload["data"]
+    except Exception:
+        pass
+
+
+def _save_candle_cache() -> None:
+    global _CANDLE_CACHE_DIRTY
+    if not _CANDLE_CACHE_DIRTY or not _CANDLE_CACHE_MEM:
+        return
+    try:
+        tmp_path = _CANDLE_CACHE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump({"date": date.today().isoformat(), "data": _CANDLE_CACHE_MEM}, f, separators=(",", ":"))
+        os.replace(tmp_path, _CANDLE_CACHE_FILE)
+        _CANDLE_CACHE_DIRTY = False
+    except Exception:
+        pass
+
+
 def fetch_candles(symbol: str, period: str = "d", live_quote: dict | None = None) -> tuple[list, str]:
+    global _CANDLE_CACHE_DIRTY
     eod_key = os.getenv("EODHD_API_KEY") or os.getenv("EODHD_TOKEN") or DEFAULT_EODHD_KEY
     interval_map = {"d": "1d", "w": "1wk", "m": "1mo"}
     yf_interval = interval_map.get(period, "1d")
+
+    if period == "d" and os.getenv("UMWA_FORCE_FRESH") != "1":
+        with _CANDLE_CACHE_LOCK:
+            cached = _CANDLE_CACHE_MEM.get(symbol)
+        if cached and len(cached) >= 60:
+            candles_copy = [dict(c) for c in cached]
+            candles_copy = _merge_live_quote_into_candles(candles_copy, live_quote, period=period)
+            return candles_copy, "EODHD+SmartCache+Live"
 
     # Primär EODHD + Live-Quote-Fusion für maximale Konsistenz, Fallback Yahoo Finance
     if eod_key:
         try:
             candles = fetch_candles_eodhd(symbol, eod_key, period=period, days=730)
             if candles and len(candles) >= 60:
+                if period == "d":
+                    with _CANDLE_CACHE_LOCK:
+                        _CANDLE_CACHE_MEM[symbol] = [dict(c) for c in candles]
+                        _CANDLE_CACHE_DIRTY = True
                 candles = _merge_live_quote_into_candles(candles, live_quote, period=period)
                 return candles, "EODHD+Live"
         except Exception:
             pass
 
     candles = fetch_candles_yahoo(symbol, interval=yf_interval, range_str="2y")
+    if period == "d" and candles and len(candles) >= 60:
+        with _CANDLE_CACHE_LOCK:
+            _CANDLE_CACHE_MEM[symbol] = [dict(c) for c in candles]
+            _CANDLE_CACHE_DIRTY = True
     candles = _merge_live_quote_into_candles(candles, live_quote, period=period)
     return candles, "Yahoo+Live"
 
@@ -2036,12 +2091,15 @@ def scan_symbols(symbols: list, period: str = "d", only_signals: bool = False):
     print("Daten-Feed: EODHD Split-Adjusted + Yahoo Real-Time Quote & Fundamental-Fusion...")
     print("=" * 106)
 
+    if period == "d":
+        _load_candle_cache()
+
     live_quotes = fetch_batch_quotes_and_fundamentals(symbols)
 
     results = []
     errors = []
 
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    with ThreadPoolExecutor(max_workers=24) as pool:
         future_map = {pool.submit(_process_one, sym, period, live_quotes.get(sym)): sym for sym in symbols}
         for fut in as_completed(future_map):
             sym = future_map[fut]
@@ -2049,6 +2107,9 @@ def scan_symbols(symbols: list, period: str = "d", only_signals: bool = False):
                 results.append(fut.result())
             except Exception as e:
                 errors.append((sym, str(e)))
+
+    if period == "d":
+        _save_candle_cache()
 
     priority = {"STRONG_BUY": 0, "STRONG_SELL": 1, "WEAK_BUY": 2, "WEAK_SELL": 3, "NEUTRAL": 4, "INACTIVE": 5}
     results.sort(key=lambda r: (
@@ -2841,7 +2902,7 @@ def export_html_dashboard(results: list, html_path: str):
     justify-content: space-between;
   }}
   .kpi-lbl {{ font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.6px; color: var(--txt-muted); }}
-  .kpi-val {{ font-size: 24px; font-weight: 700; margin-top: 6px; letter-spacing: -0.5px; }}
+  .kpi-val {{ font-size: 26px; font-weight: 800; margin-top: 6px; letter-spacing: -0.5px; }}
   .kpi-sub {{ font-size: 11.5px; color: var(--txt-muted); margin-top: 4px; }}
 
   /* Control Bar */
@@ -2936,8 +2997,8 @@ def export_html_dashboard(results: list, html_path: str):
     border: 1px solid var(--border-strong);
     padding: 3px 8px;
     border-radius: 5px;
-    font-weight: 700;
-    font-size: 13.5px;
+    font-weight: 800;
+    font-size: 14.5px;
     text-decoration: none;
     display: inline-flex;
     align-items: center;
@@ -2956,14 +3017,14 @@ def export_html_dashboard(results: list, html_path: str):
   .company-name {{ font-size: 12px; color: var(--txt-secondary); margin-top: 5px; font-weight: 500; }}
   .date-sub {{ font-size: 10.5px; color: var(--txt-muted); margin-top: 2px; }}
 
-  .price-main {{ font-size: 14.5px; font-weight: 700; color: var(--txt-primary); white-space: nowrap; }}
+  .price-main {{ font-size: 16px; font-weight: 800; letter-spacing: -0.3px; color: var(--txt-primary); white-space: nowrap; }}
   .chg-pill {{
     display: inline-block;
     margin-top: 4px;
-    padding: 2px 6px;
+    padding: 2px 6.5px;
     border-radius: 4px;
-    font-size: 11px;
-    font-weight: 600;
+    font-size: 11.5px;
+    font-weight: 700;
   }}
   .chg-pos {{ background: var(--emerald-bg); color: var(--emerald); }}
   .chg-neg {{ background: var(--rose-bg); color: var(--rose); }}
@@ -2978,8 +3039,8 @@ def export_html_dashboard(results: list, html_path: str):
     display: inline-block;
     padding: 5px 10px;
     border-radius: 5px;
-    font-size: 11.5px;
-    font-weight: 700;
+    font-size: 12.5px;
+    font-weight: 800;
     letter-spacing: 0.3px;
     white-space: nowrap;
   }}
@@ -2995,8 +3056,8 @@ def export_html_dashboard(results: list, html_path: str):
   .ind-chip {{
     padding: 2.5px 7px;
     border-radius: 4px;
-    font-size: 10.5px;
-    font-weight: 600;
+    font-size: 11px;
+    font-weight: 700;
     border: 1px solid transparent;
   }}
   .chip-bull {{ background: var(--emerald-bg); color: var(--emerald); border-color: rgba(16,185,129,0.25); }}
@@ -3016,7 +3077,7 @@ def export_html_dashboard(results: list, html_path: str):
   .sr-tag {{ font-size: 9.5px; font-weight: 700; padding: 1.5px 5px; border-radius: 3px; letter-spacing: 0.4px; }}
   .sup-tag {{ background: rgba(56, 189, 248, 0.18); color: var(--sky); }}
   .res-tag {{ background: rgba(168, 85, 247, 0.18); color: #c084fc; }}
-  .sr-price {{ font-weight: 700; color: var(--txt-primary); }}
+  .sr-price {{ font-size: 12.5px; font-weight: 800; color: var(--txt-primary); }}
   .sr-dist {{ color: var(--txt-secondary); font-size: 11px; }}
   .sr-meta {{ margin-left: auto; font-size: 10.5px; color: var(--txt-muted); }}
 
@@ -3034,13 +3095,13 @@ def export_html_dashboard(results: list, html_path: str):
   .opt-badge {{ font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 3px; letter-spacing: 0.4px; }}
   .opt-badge-put {{ background: var(--emerald-bg); color: var(--emerald); }}
   .opt-badge-call {{ background: var(--rose-bg); color: var(--rose); }}
-  .opt-contract {{ font-size: 12px; font-weight: 700; color: var(--txt-primary); margin-bottom: 6px; }}
+  .opt-contract {{ font-size: 13px; font-weight: 800; color: var(--txt-primary); margin-bottom: 6px; }}
   .opt-metrics-grid {{
     display: grid; grid-template-columns: 1fr 1fr; gap: 5px 10px;
     border-top: 1px solid rgba(255,255,255,0.05); padding-top: 6px;
   }}
   .opt-metrics-grid .lbl {{ display: block; font-size: 9.5px; color: var(--txt-muted); letter-spacing: 0.4px; }}
-  .opt-metrics-grid .val {{ font-size: 11.5px; font-weight: 600; color: var(--txt-primary); }}
+  .opt-metrics-grid .val {{ font-size: 12.5px; font-weight: 700; color: var(--txt-primary); }}
   .shield-banner {{
     margin-top: 7px; padding: 4px 7px; border-radius: 4px;
     background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.3);
@@ -3068,10 +3129,10 @@ def export_html_dashboard(results: list, html_path: str):
   .prob-seg-inv {{ background: var(--rose); }}
   .ew-prob-row {{ font-size: 11.5px; color: var(--txt-secondary); margin-bottom: 5px; line-height: 1.35; }}
   .ew-levels-row {{
-    display: flex; justify-content: space-between; font-size: 10.5px; color: var(--txt-muted);
+    display: flex; justify-content: space-between; font-size: 11px; color: var(--txt-muted);
     border-top: 1px solid rgba(255,255,255,0.05); padding-top: 5px;
   }}
-  .ew-levels-row b {{ color: var(--txt-secondary); }}
+  .ew-levels-row b {{ color: var(--txt-primary); font-weight: 700; }}
 
   /* Fundamentals Card */
   .tier-badge {{ font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 3px; letter-spacing: 0.4px; }}
@@ -3079,8 +3140,8 @@ def export_html_dashboard(results: list, html_path: str):
   .tier-good {{ background: var(--sky-bg); color: var(--sky); border: 1px solid rgba(56,189,248,0.3); }}
   .tier-fair {{ background: var(--amber-bg); color: var(--amber); }}
   .tier-exp {{ background: var(--rose-bg); color: var(--rose); }}
-  .score-chip {{ font-size: 11px; font-weight: 700; color: var(--txt-secondary); }}
-  .metric-primary {{ font-size: 11.5px; font-weight: 700; color: var(--txt-primary); margin-bottom: 3px; }}
+  .score-chip {{ font-size: 12px; font-weight: 800; color: var(--txt-primary); }}
+  .metric-primary {{ font-size: 12.5px; font-weight: 700; color: var(--txt-primary); margin-bottom: 3px; }}
   .metric-secondary {{ font-size: 11.5px; color: var(--txt-secondary); margin-bottom: 3px; line-height: 1.35; }}
   .metric-meta {{ font-size: 10.5px; color: var(--txt-muted); margin-bottom: 4px; }}
   .earn-alert {{ color: var(--rose); font-weight: 700; font-size: 11px; background: var(--rose-bg); padding: 2px 6px; border-radius: 3px; display: inline-block; }}
@@ -3150,14 +3211,14 @@ def export_html_dashboard(results: list, html_path: str):
     gap: 10px;
   }}
   .tv-sym-group {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
-  .tv-sym-title {{ font-size: 16px; font-weight: 800; color: var(--txt-primary); letter-spacing: -0.3px; }}
+  .tv-sym-title {{ font-size: 17.5px; font-weight: 800; color: var(--txt-primary); letter-spacing: -0.3px; }}
   .tv-ohlc-bar {{
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-    font-size: 11.5px; color: var(--txt-secondary);
+    font-size: 12.5px; color: var(--txt-secondary);
     background: rgba(15, 23, 42, 0.75);
     padding: 4px 10px; border-radius: 5px; border: 1px solid #1e293b;
   }}
-  .tv-ohlc-bar span b {{ color: var(--txt-primary); }}
+  .tv-ohlc-bar span b {{ color: var(--txt-primary); font-weight: 700; }}
   .tv-btn-group {{ display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }}
   .tv-mini-btn {{
     background: #161f30; color: var(--txt-secondary);
@@ -3177,7 +3238,7 @@ def export_html_dashboard(results: list, html_path: str):
     background: #090d14;
     user-select: none;
     -webkit-user-select: none;
-    touch-action: pan-y;
+    touch-action: none;
   }}
   @media (max-width: 768px) {{
     .tv-canvas-wrap {{ height: 620px; }}
@@ -3389,10 +3450,15 @@ def export_html_dashboard(results: list, html_path: str):
               <span>C <b>—</b></span>
             </div>
             <div class="tv-btn-group">
-              <button type="button" class="tv-mini-btn mono" onclick="setChartRange(65, this)">3M</button>
-              <button type="button" class="tv-mini-btn mono" onclick="setChartRange(126, this)">6M</button>
-              <button type="button" class="tv-mini-btn mono active" onclick="setChartRange(252, this)">1J (252T)</button>
-              <span style="width:1px;height:16px;background:#26334d;margin:0 4px"></span>
+              <button type="button" class="tv-mini-btn mono" onclick="setChartRange(22, this)" title="1 Monat (22 Handelstage)">1M</button>
+              <button type="button" class="tv-mini-btn mono" onclick="setChartRange(65, this)" title="3 Monate (65 Handelstage)">3M</button>
+              <button type="button" class="tv-mini-btn mono" onclick="setChartRange(126, this)" title="6 Monate (126 Handelstage)">6M</button>
+              <button type="button" class="tv-mini-btn mono active" onclick="setChartRange(252, this)" title="1 Jahr (252 Handelstage)">1J (252T)</button>
+              <span style="width:1px;height:16px;background:#26334d;margin:0 3px"></span>
+              <button type="button" class="tv-mini-btn mono" onclick="zoomChartBy(0.75)" title="Reinzoomen (Mausrad hoch / +)">🔍＋</button>
+              <button type="button" class="tv-mini-btn mono" onclick="zoomChartBy(1.33)" title="Rauszoomen (Mausrad runter / -)">🔍－</button>
+              <button type="button" id="tvAutoBtn" class="tv-mini-btn mono" onclick="resetChartView()" title="Ansicht &amp; Skalierung zurücksetzen (Doppelklick im Chart)">⟲ Auto</button>
+              <span style="width:1px;height:16px;background:#26334d;margin:0 3px"></span>
               <button type="button" id="togBB" class="tv-mini-btn active" onclick="toggleChartLayer('bb', this)">BB (20,2)</button>
               <button type="button" id="togEMA" class="tv-mini-btn active" onclick="toggleChartLayer('ema', this)">EMAs</button>
               <button type="button" id="togSR" class="tv-mini-btn active" onclick="toggleChartLayer('sr', this)">🔵 S/R-Linien</button>
@@ -3515,7 +3581,13 @@ let chartBarsCount = 252;
 let chartLayers = {{ bb: true, ema: true, sr: true, opt: true }};
 let wlFilterMode = 'all';
 let hoverBarIdx = null;
+let hoverRelX = null;
+let hoverRelY = null;
 let cachedChartCalc = null;
+let tvViewStart = null;
+let tvViewEnd = null;
+let tvPriceZoom = 1.0;
+let tvPricePanPx = 0.0;
 
 function switchMainView(view, btn) {{
   document.getElementById('view-scanner').style.display = (view === 'scanner') ? '' : 'none';
@@ -3779,14 +3851,44 @@ function renderWatchlistSidebar() {{
     const shieldIcon = (d.opt && d.opt.sh) ? ' 🛡️' : '';
     return '<div class="tv-wl-row' + isAct + '" data-wlsym="' + sym + '" onclick="selectChartSymbol(this.dataset.wlsym)">' +
       '<div>' +
-        '<div style="display:flex;align-items:center;gap:4px">' + dot + '<b class="mono" style="font-size:12.5px;color:var(--txt-primary)">' + sym + '</b>' + shieldIcon + ' ' + pill + '</div>' +
+        '<div style="display:flex;align-items:center;gap:4px">' + dot + '<b class="mono" style="font-size:13px;font-weight:800;color:var(--txt-primary)">' + sym + '</b>' + shieldIcon + ' ' + pill + '</div>' +
         '<div style="font-size:10.5px;color:var(--txt-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:155px">' + (d.n || sym) + '</div>' +
       '</div>' +
-      '<div class="mono" style="font-size:12px;font-weight:700;color:var(--txt-primary);text-align:right">' + d.last.toFixed(2) + '</div>' +
-      '<div class="mono" style="font-size:11px;font-weight:600;color:' + chgClr + ';text-align:right;min-width:54px">' + chg + '</div>' +
+      '<div class="mono" style="font-size:13px;font-weight:800;color:var(--txt-primary);text-align:right">' + d.last.toFixed(2) + '</div>' +
+      '<div class="mono" style="font-size:11.5px;font-weight:700;color:' + chgClr + ';text-align:right;min-width:56px">' + chg + '</div>' +
     '</div>';
   }}).join('');
   listEl.innerHTML = html || '<div style="padding:18px;color:var(--txt-muted);font-size:12px">Keine Werte für diesen Filter gefunden.</div>';
+}}
+
+function clampChartViewport(total) {{
+  if (!total || total < 1) return;
+  const minSpan = Math.min(14, total);
+  const maxSpan = total + 8;
+  if (tvViewStart == null || tvViewEnd == null || isNaN(tvViewStart) || isNaN(tvViewEnd)) {{
+    tvViewStart = Math.max(0, total - chartBarsCount);
+    tvViewEnd = total;
+  }}
+  let span = tvViewEnd - tvViewStart;
+  if (span < minSpan) {{
+    const mid = (tvViewStart + tvViewEnd) * 0.5;
+    tvViewStart = mid - minSpan * 0.5;
+    tvViewEnd = mid + minSpan * 0.5;
+    span = minSpan;
+  }} else if (span > maxSpan) {{
+    tvViewStart = 0;
+    tvViewEnd = total;
+    span = total;
+  }}
+  const maxRight = total + Math.min(8, Math.max(2, span * 0.12));
+  if (tvViewEnd > maxRight) {{
+    tvViewEnd = maxRight;
+    tvViewStart = tvViewEnd - span;
+  }}
+  if (tvViewStart < 0) {{
+    tvViewStart = 0;
+    tvViewEnd = Math.min(maxRight, span);
+  }}
 }}
 
 function setChartRange(bars, btn) {{
@@ -3797,9 +3899,44 @@ function setChartRange(bars, btn) {{
   if (btn) btn.classList.add('active');
   hoverBarIdx = null;
   if (activeChartSym) {{
-    cachedChartCalc = computeUmwaSeries(activeChartSym);
-    drawUmwaChart();
+    if (!cachedChartCalc || cachedChartCalc.sym !== activeChartSym) {{
+      cachedChartCalc = computeUmwaSeries(activeChartSym);
+    }}
+    if (cachedChartCalc) {{
+      const total = cachedChartCalc.closes.length;
+      tvViewStart = Math.max(0, total - bars);
+      tvViewEnd = total;
+      tvPriceZoom = 1.0;
+      tvPricePanPx = 0.0;
+      drawUmwaChart();
+    }}
   }}
+}}
+
+function zoomChartBy(factor, anchorRatio = 0.82) {{
+  if (!cachedChartCalc) return;
+  const total = cachedChartCalc.closes.length;
+  clampChartViewport(total);
+  const curSpan = tvViewEnd - tvViewStart;
+  const minSpan = Math.min(14, total);
+  const maxSpan = total;
+  const newSpan = Math.max(minSpan, Math.min(maxSpan, curSpan * factor));
+  const anchorBar = tvViewStart + anchorRatio * curSpan;
+  tvViewStart = anchorBar - anchorRatio * newSpan;
+  tvViewEnd = tvViewStart + newSpan;
+  clampChartViewport(total);
+  drawUmwaChart();
+}}
+
+function resetChartView() {{
+  if (!cachedChartCalc) return;
+  const total = cachedChartCalc.closes.length;
+  tvViewStart = Math.max(0, total - chartBarsCount);
+  tvViewEnd = total;
+  tvPriceZoom = 1.0;
+  tvPricePanPx = 0.0;
+  hoverBarIdx = null;
+  drawUmwaChart();
 }}
 
 function toggleChartLayer(key, btn) {{
@@ -3926,28 +4063,27 @@ function computeUmwaSeries(sym) {{
   const sigLine = computeEmaWithSeed(macdLine, 9, macdLine[0]);
   const macdHist = macdLine.map((v, i) => v - sigLine[i]);
 
-  const startIdx = Math.max(0, total - chartBarsCount);
   return {{
     sym,
     meta: d,
-    dates: dates.slice(startIdx),
-    opens: opens.slice(startIdx),
-    highs: highs.slice(startIdx),
-    lows: lows.slice(startIdx),
-    closes: closes.slice(startIdx),
-    bbMid: bbMid.slice(startIdx),
-    bbUpper: bbUpper.slice(startIdx),
-    bbLower: bbLower.slice(startIdx),
-    ema20: ema20.slice(startIdx),
-    ema50: ema50.slice(startIdx),
-    ema100: ema100.slice(startIdx),
-    ema200: ema200.slice(startIdx),
-    stShortK: stShort.k.slice(startIdx),
-    stShortD: stShort.d.slice(startIdx),
-    stLongK: stLong.k.slice(startIdx),
-    stLongD: stLong.d.slice(startIdx),
-    rsi: rsi.slice(startIdx),
-    macdHist: macdHist.slice(startIdx),
+    dates,
+    opens,
+    highs,
+    lows,
+    closes,
+    bbMid,
+    bbUpper,
+    bbLower,
+    ema20,
+    ema50,
+    ema100,
+    ema200,
+    stShortK: stShort.k,
+    stShortD: stShort.d,
+    stLongK: stLong.k,
+    stLongD: stLong.d,
+    rsi,
+    macdHist,
   }};
 }}
 
@@ -3956,6 +4092,13 @@ function selectChartSymbol(sym) {{
   activeChartSym = sym;
   hoverBarIdx = null;
   cachedChartCalc = computeUmwaSeries(sym);
+  if (cachedChartCalc) {{
+    const total = cachedChartCalc.closes.length;
+    tvViewStart = Math.max(0, total - chartBarsCount);
+    tvViewEnd = total;
+    tvPriceZoom = 1.0;
+    tvPricePanPx = 0.0;
+  }}
 
   document.querySelectorAll('#tvWlList .tv-wl-row').forEach(r => {{
     r.classList.toggle('active', r.getAttribute('data-wlsym') === sym);
@@ -3993,25 +4136,25 @@ function selectChartSymbol(sym) {{
     return '<span class="mono ind-pill ' + cls + '" style="margin-right:4px">' + lbl + ' ' + ic + '</span>';
   }};
   const rsnHtml = (d.rsn && d.rsn.length)
-    ? d.rsn.map(x => '<div style="font-size:11px;color:var(--txt-secondary);margin-top:3px">• ' + x + '</div>').join('')
-    : '<div style="font-size:11px;color:var(--txt-muted);margin-top:4px">Keine extremen Umkehr-Trigger am aktuellen Tag.</div>';
+    ? d.rsn.map(x => '<div style="font-size:11.5px;color:var(--txt-secondary);margin-top:3px">• ' + x + '</div>').join('')
+    : '<div style="font-size:11.5px;color:var(--txt-muted);margin-top:4px">Keine extremen Umkehr-Trigger am aktuellen Tag.</div>';
   document.getElementById('tvCardInd').innerHTML = '<div style="margin-bottom:6px">' +
     pill('BB', ind.bb) + pill('RSI', ind.rsi) + pill('MACD', ind.macd) + pill('STOCH', ind.stoch) + '</div>' + rsnHtml;
 
   const supHtml = (d.sup || []).map(s =>
-    '<div class="mono" style="font-size:11.5px;color:#60a5fa;margin-bottom:3px">🔵 <b>SUP ' + s.p.toFixed(2) + ' $</b> (' + (s.d >= 0 ? '+' : '') + s.d.toFixed(1) + '% · ' + s.b + 'x Touch / ' + s.v + ' Pivots)</div>'
+    '<div class="mono" style="font-size:12px;color:#60a5fa;margin-bottom:3px">🔵 <b>SUP ' + s.p.toFixed(2) + ' $</b> (' + (s.d >= 0 ? '+' : '') + s.d.toFixed(1) + '% · ' + s.b + 'x Touch / ' + s.v + ' Pivots)</div>'
   ).join('');
   const resHtml = (d.res || []).map(r =>
-    '<div class="mono" style="font-size:11.5px;color:#38bdf8;margin-bottom:3px">🔵 <b>RES ' + r.p.toFixed(2) + ' $</b> (+' + r.d.toFixed(1) + '% · ' + r.b + 'x Touch / ' + r.v + ' Pivots)</div>'
+    '<div class="mono" style="font-size:12px;color:#38bdf8;margin-bottom:3px">🔵 <b>RES ' + r.p.toFixed(2) + ' $</b> (+' + r.d.toFixed(1) + '% · ' + r.b + 'x Touch / ' + r.v + ' Pivots)</div>'
   ).join('');
   document.getElementById('tvCardSR').innerHTML = (supHtml || resHtml) ? (supHtml + resHtml) : '<div class="txt-muted">Keine validierte horizontale Linie im nahen Radius.</div>';
 
   if (d.opt && d.opt.q) {{
-    const shBadge = d.opt.sh ? '<div style="color:var(--emerald);font-weight:700;font-size:11px;margin-top:4px">🛡️ GESCHÜTZT durch S/R-Linie</div>' : '';
+    const shBadge = d.opt.sh ? '<div style="color:var(--emerald);font-weight:700;font-size:11.5px;margin-top:4px">🛡️ GESCHÜTZT durch S/R-Linie</div>' : '';
     document.getElementById('tvCardOpt').innerHTML =
-      '<div class="mono" style="font-size:12px;font-weight:700;color:var(--txt-primary)">' + (d.opt.con || d.opt.t) + '</div>' +
-      '<div class="mono" style="font-size:11.5px;color:var(--txt-secondary);margin-top:3px">Strike: <b>' + (d.opt.k || 0).toFixed(2) + ' $</b> (OTM ' + (d.opt.otm || 0).toFixed(1) + '%) · Δ ' + (d.opt.d || 0).toFixed(2) + '</div>' +
-      '<div class="mono" style="font-size:11.5px;color:var(--emerald);font-weight:700;margin-top:2px">Prämie: +' + (d.opt.p || 0).toFixed(2) + ' $ (+' + (d.opt.pr || 0).toFixed(2) + '%)</div>' + shBadge;
+      '<div class="mono" style="font-size:13px;font-weight:800;color:var(--txt-primary)">' + (d.opt.con || d.opt.t) + '</div>' +
+      '<div class="mono" style="font-size:12px;color:var(--txt-secondary);margin-top:3px">Strike: <b style="color:var(--txt-primary)">' + (d.opt.k || 0).toFixed(2) + ' $</b> (OTM ' + (d.opt.otm || 0).toFixed(1) + '%) · Δ ' + (d.opt.d || 0).toFixed(2) + '</div>' +
+      '<div class="mono" style="font-size:12.5px;color:var(--emerald);font-weight:800;margin-top:2px">Prämie: +' + (d.opt.p || 0).toFixed(2) + ' $ (+' + (d.opt.pr || 0).toFixed(2) + '%)</div>' + shBadge;
   }} else if (d.opt) {{
     document.getElementById('tvCardOpt').innerHTML = '<div class="txt-muted" style="font-size:11.5px">' + (d.opt.note || 'Kein qualifizierter Weekly-Strike') + '</div>';
   }} else {{
@@ -4020,9 +4163,9 @@ function selectChartSymbol(sym) {{
 
   const ew = d.ew || {{}};
   document.getElementById('tvCardEW').innerHTML =
-    '<div style="font-weight:700;color:var(--txt-primary);font-size:11.5px">' + (ew.w ? '[' + ew.w + '] ' : '') + (ew.ph || 'Neutral') + ' (' + (ew.pr || 50) + '%)</div>' +
+    '<div style="font-weight:700;color:var(--txt-primary);font-size:12px">' + (ew.w ? '[' + ew.w + '] ' : '') + (ew.ph || 'Neutral') + ' (' + (ew.pr || 50) + '%)</div>' +
     '<div style="font-size:11px;color:var(--txt-secondary);margin-top:2px">' + (ew.sc || '') + '</div>' +
-    '<div class="mono" style="font-size:11px;color:var(--sky);margin-top:5px">Fundamental: <b>' + (d.fl || '') + ' (' + (d.fs || 0) + '/100)</b></div>';
+    '<div class="mono" style="font-size:11.5px;color:var(--sky);margin-top:5px">Fundamental: <b>' + (d.fl || '') + ' (' + (d.fs || 0) + '/100)</b></div>';
 
   drawUmwaChart();
 }}
@@ -4041,8 +4184,8 @@ function drawUmwaChart() {{
 
   const W = rect.width;
   const H = rect.height;
-  const axisW = 76;
-  const timeH = 24;
+  const axisW = 78;
+  const timeH = 26;
   const plotW = W - axisW;
   const plotH = H - timeH;
 
@@ -4053,11 +4196,19 @@ function drawUmwaChart() {{
   const p4Top = p3Top + p3H, p4H = plotH - p4Top;
 
   const c = cachedChartCalc;
-  const n = c.closes.length;
-  if (!n) return;
-  const idx = (hoverBarIdx != null && hoverBarIdx >= 0 && hoverBarIdx < n) ? hoverBarIdx : (n - 1);
+  const total = c.closes.length;
+  if (!total) return;
 
-  // OHLC Header-Leiste aktualisieren
+  clampChartViewport(total);
+  const vStart = tvViewStart;
+  const vEnd = tvViewEnd;
+  const visSpan = Math.max(5, vEnd - vStart);
+  const iStart = Math.max(0, Math.floor(vStart));
+  const iEnd = Math.min(total - 1, Math.ceil(vEnd));
+
+  const idx = (hoverBarIdx != null && hoverBarIdx >= 0 && hoverBarIdx < total) ? hoverBarIdx : (total - 1);
+
+  // OHLC Header-Leiste aktualisieren (leicht größere, kontrastreiche Zahlen)
   const ohlcEl = document.getElementById('tvOhlcBar');
   if (ohlcEl) {{
     const prevC = idx > 0 ? c.closes[idx - 1] : c.opens[idx];
@@ -4070,8 +4221,8 @@ function drawUmwaChart() {{
       '<span>O <b style="color:' + clr + '">' + c.opens[idx].toFixed(2) + '</b></span>' +
       '<span>H <b style="color:' + clr + '">' + c.highs[idx].toFixed(2) + '</b></span>' +
       '<span>L <b style="color:' + clr + '">' + c.lows[idx].toFixed(2) + '</b></span>' +
-      '<span>C <b style="color:' + clr + '">' + c.closes[idx].toFixed(2) + '</b></span>' +
-      '<span style="color:' + clr + ';font-weight:700">' + sign + diff.toFixed(2) + ' (' + sign + pct.toFixed(2) + '%)</span>';
+      '<span>C <b style="color:' + clr + ';font-size:13.5px">' + c.closes[idx].toFixed(2) + ' $</b></span>' +
+      '<span style="color:' + clr + ';font-weight:800;font-size:13px">' + sign + diff.toFixed(2) + ' (' + sign + pct.toFixed(2) + '%)</span>';
   }}
 
   // Hintergrund
@@ -4080,14 +4231,14 @@ function drawUmwaChart() {{
   ctx.fillStyle = '#0d131f';
   ctx.fillRect(plotW, 0, axisW, H);
 
-  const xOf = (i) => 8 + ((i + 0.5) / n) * (plotW - 16);
-  const barW = Math.max(1.5, Math.min(9.0, ((plotW - 16) / n) * 0.72));
+  const xOf = (i) => 8 + ((i - vStart + 0.5) / visSpan) * (plotW - 16);
+  const barW = Math.max(1.5, Math.min(18.0, ((plotW - 16) / visSpan) * 0.74));
 
   // ===================================================================
   // PANE 1: PREIS + BB & EMAs + BLAUE S/R-LINIEN + OPTIONS-STRIKE
   // ===================================================================
   let minP = Infinity, maxP = -Infinity;
-  for (let i = 0; i < n; i++) {{
+  for (let i = iStart; i <= iEnd; i++) {{
     if (c.lows[i] < minP) minP = c.lows[i];
     if (c.highs[i] > maxP) maxP = c.highs[i];
     if (chartLayers.bb && c.bbUpper[i] != null) {{
@@ -4095,9 +4246,13 @@ function drawUmwaChart() {{
       if (c.bbUpper[i] > maxP) maxP = c.bbUpper[i];
     }}
   }}
-  // Beziehe nahe S/R-Linien & Options-Strike in die Y-Skala ein, damit man die Schutzmauer immer im Bild sieht
+  if (!isFinite(minP) || !isFinite(maxP)) {{
+    minP = c.closes[total - 1] * 0.9;
+    maxP = c.closes[total - 1] * 1.1;
+  }}
+  // Beziehe nahe S/R-Linien & Options-Strike in die Basis-Y-Skala ein
   const midVis = (minP + maxP) * 0.5;
-  const spanVis = Math.max(maxP - minP, midVis * 0.05);
+  const spanVis = Math.max(maxP - minP, midVis * 0.04);
   if (chartLayers.sr) {{
     (c.meta.sup || []).forEach(s => {{
       if (s.p >= minP - spanVis * 0.35 && s.p <= maxP + spanVis * 0.2) {{
@@ -4121,38 +4276,72 @@ function drawUmwaChart() {{
   }}
   const padP = (maxP - minP) * 0.075 || 1.0;
   minP -= padP; maxP += padP;
-  const yOfP1 = (val) => p1Top + 12 + (1.0 - (val - minP) / (maxP - minP)) * (p1H - 24);
 
-  // Horizontales Preis-Gitter
+  // TradingView vertikaler Preis-Zoom & Pan anwenden
+  const baseMidP = (minP + maxP) * 0.5;
+  const scaledSpanP = Math.max(0.01, (maxP - minP) / Math.max(0.15, tvPriceZoom));
+  const panPriceShift = (tvPricePanPx / Math.max(60, p1H - 24)) * scaledSpanP;
+  minP = baseMidP - scaledSpanP * 0.5 + panPriceShift;
+  maxP = baseMidP + scaledSpanP * 0.5 + panPriceShift;
+
+  const yOfP1 = (val) => p1Top + 12 + (1.0 - (val - minP) / (maxP - minP)) * (p1H - 24);
+  const priceOfY1 = (y) => minP + (1.0 - (y - (p1Top + 12)) / (p1H - 24)) * (maxP - minP);
+
+  // Horizontales Preis-Gitter + Rechte Preisachse
   ctx.strokeStyle = 'rgba(30, 41, 59, 0.55)';
   ctx.lineWidth = 1;
-  ctx.font = '10.5px "SF Mono", Menlo, monospace';
+  ctx.font = '600 11px "SF Mono", Menlo, monospace';
   const stepsP1 = 6;
   for (let s = 0; s <= stepsP1; s++) {{
     const val = minP + (s / stepsP1) * (maxP - minP);
     const y = yOfP1(val);
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
-    ctx.fillStyle = '#64748b';
+    ctx.fillStyle = '#94a3b8';
     ctx.fillText(val.toFixed(2), plotW + 6, y + 3.5);
   }}
 
-  // Vertikales Monats-Gitter + Monatsnamen unten
+  // Adaptives vertikales Zeit-Gitter (Monate bei Übersicht, Wochen/Tage beim Reinzoomen wie in TradingView!)
   const monthNames = ['Jan', 'Feb', 'Mär', 'Apr', 'Mai', 'Jun', 'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Dez'];
   let lastMonth = '';
-  for (let i = 0; i < n; i++) {{
-    const ym = c.dates[i].slice(0, 7);
-    if (ym !== lastMonth) {{
-      lastMonth = ym;
-      const x = xOf(i);
+  let lastLabelX = -100;
+  const stepBars = visSpan <= 28 ? 3 : (visSpan <= 65 ? 5 : (visSpan <= 115 ? 10 : 0));
+  for (let i = iStart; i <= iEnd; i++) {{
+    const dStr = c.dates[i] || '';
+    if (!dStr) continue;
+    const ym = dStr.slice(0, 7);
+    const mNum = parseInt(dStr.slice(5, 7), 10) - 1;
+    const dayStr = dStr.slice(8, 10);
+    const yr = dStr.slice(2, 4);
+    const x = xOf(i);
+    if (x < 10 || x > plotW - 14) continue;
+
+    let drawTick = false;
+    let lbl = '';
+    if (stepBars === 0) {{
+      if (ym !== lastMonth) {{
+        lastMonth = ym;
+        drawTick = true;
+        lbl = (mNum === 0) ? (monthNames[mNum] + " '" + yr) : monthNames[mNum];
+      }}
+    }} else {{
+      if (ym !== lastMonth) {{
+        lastMonth = ym;
+        drawTick = true;
+        lbl = dayStr + '. ' + monthNames[mNum];
+      }} else if ((i - iStart) % stepBars === 0) {{
+        drawTick = true;
+        lbl = dayStr + '. ' + monthNames[mNum];
+      }}
+    }}
+
+    if (drawTick && (x - lastLabelX) >= 54) {{
+      lastLabelX = x;
       ctx.strokeStyle = 'rgba(30, 41, 59, 0.42)';
       ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, plotH); ctx.stroke();
-      if (x > 28 && x < plotW - 30) {{
-        const mNum = parseInt(c.dates[i].slice(5, 7), 10) - 1;
-        const yr = c.dates[i].slice(2, 4);
-        const lbl = (mNum === 0) ? (monthNames[mNum] + " '" + yr) : monthNames[mNum];
-        ctx.fillStyle = '#64748b';
-        ctx.fillText(lbl, x - 12, plotH + 16);
-      }}
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '600 10.5px "SF Mono", Menlo, monospace';
+      const lw = ctx.measureText(lbl).width;
+      ctx.fillText(lbl, Math.max(4, Math.min(plotW - lw - 4, x - lw * 0.5)), plotH + 16);
     }}
   }}
 
@@ -4163,7 +4352,9 @@ function drawUmwaChart() {{
     if (dashed) ctx.setLineDash([4, 3]);
     ctx.beginPath();
     let started = false;
-    for (let i = 0; i < n; i++) {{
+    const drawFrom = Math.max(0, iStart - 1);
+    const drawTo = Math.min(total - 1, iEnd + 1);
+    for (let i = drawFrom; i <= drawTo; i++) {{
       if (arr[i] == null) continue;
       const x = xOf(i), y = yFn(arr[i]);
       if (!started) {{ ctx.moveTo(x, y); started = true; }}
@@ -4174,21 +4365,29 @@ function drawUmwaChart() {{
   }};
 
   const drawAxisTag = (y, topB, botB, text, bg, fg = '#fff') => {{
-    if (y < topB + 6 || y > botB - 6) return;
+    if (y < topB + 7 || y > botB - 7) return;
     ctx.fillStyle = bg;
-    ctx.fillRect(plotW + 1, y - 8, axisW - 2, 16);
+    ctx.fillRect(plotW + 1, y - 9, axisW - 2, 18);
     ctx.fillStyle = fg;
-    ctx.font = 'bold 10px "SF Mono", Menlo, monospace';
-    ctx.fillText(text, plotW + 5, y + 3.5);
+    ctx.font = 'bold 11px "SF Mono", Menlo, monospace';
+    ctx.fillText(text, plotW + 5, y + 4);
   }};
 
-  // 1a. Bollinger Bänder (20, 2.0) wie im TradingView-Screenshot (türkises Band + Füllung)
+  // Clip Pane 1 für sauberes Zeichnen beim vertikalen/horizontalen Zoomen
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, p1Top, plotW, p1H);
+  ctx.clip();
+
+  // 1a. Bollinger Bänder (20, 2.0)
   if (chartLayers.bb) {{
     ctx.save();
     ctx.fillStyle = 'rgba(34, 211, 238, 0.055)';
     ctx.beginPath();
     let firstIdx = -1;
-    for (let i = 0; i < n; i++) {{
+    const drawFrom = Math.max(0, iStart - 1);
+    const drawTo = Math.min(total - 1, iEnd + 1);
+    for (let i = drawFrom; i <= drawTo; i++) {{
       if (c.bbUpper[i] != null) {{
         const x = xOf(i), y = yOfP1(c.bbUpper[i]);
         if (firstIdx < 0) {{ firstIdx = i; ctx.moveTo(x, y); }}
@@ -4196,27 +4395,27 @@ function drawUmwaChart() {{
       }}
     }}
     if (firstIdx >= 0) {{
-      for (let i = n - 1; i >= firstIdx; i--) {{
+      for (let i = drawTo; i >= firstIdx; i--) {{
         if (c.bbLower[i] != null) ctx.lineTo(xOf(i), yOfP1(c.bbLower[i]));
       }}
       ctx.closePath();
       ctx.fill();
     }}
     ctx.restore();
-    drawCurve(c.bbUpper, yOfP1, 'rgba(34, 211, 238, 0.78)', 1.2);
-    drawCurve(c.bbLower, yOfP1, 'rgba(34, 211, 238, 0.78)', 1.2);
+    drawCurve(c.bbUpper, yOfP1, 'rgba(34, 211, 238, 0.78)', 1.25);
+    drawCurve(c.bbLower, yOfP1, 'rgba(34, 211, 238, 0.78)', 1.25);
     drawCurve(c.bbMid, yOfP1, 'rgba(56, 189, 248, 0.55)', 1.1, true);
   }}
 
-  // 1b. EMAs (20 Gelb, 50 Rot/Pink, 100 Blau, 200 Magenta - exakt wie im Screenshot "BB & EMAs")
+  // 1b. EMAs (20 Gelb, 50 Rot/Pink, 100 Blau, 200 Magenta)
   if (chartLayers.ema) {{
-    drawCurve(c.ema200, yOfP1, '#d946ef', 1.4);
-    drawCurve(c.ema100, yOfP1, '#3b82f6', 1.3);
-    drawCurve(c.ema50, yOfP1, '#f43f5e', 1.3);
-    drawCurve(c.ema20, yOfP1, '#facc15', 1.4);
+    drawCurve(c.ema200, yOfP1, '#d946ef', 1.45);
+    drawCurve(c.ema100, yOfP1, '#3b82f6', 1.35);
+    drawCurve(c.ema50, yOfP1, '#f43f5e', 1.35);
+    drawCurve(c.ema20, yOfP1, '#facc15', 1.45);
   }}
 
-  // 1c. Horizontale Support- & Widerstandslinien (Blaue Linien aus TradingView!)
+  // 1c. Horizontale Support- & Widerstandslinien (Blaue Linien)
   if (chartLayers.sr) {{
     (c.meta.sup || []).forEach((s, sIdx) => {{
       const y = yOfP1(s.p);
@@ -4226,14 +4425,13 @@ function drawUmwaChart() {{
         ctx.lineWidth = sIdx === 0 ? 2.0 : 1.4;
         ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
         const lbl = '🔵 SUP ' + s.p.toFixed(2) + '$ (' + s.b + 'T/' + s.v + 'P)';
-        ctx.font = 'bold 10px "SF Mono", Menlo, monospace';
+        ctx.font = 'bold 10.5px "SF Mono", Menlo, monospace';
         const tw = ctx.measureText(lbl).width + 10;
-        ctx.fillStyle = 'rgba(15, 23, 42, 0.86)';
-        ctx.fillRect(10, y - 15, tw, 14);
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+        ctx.fillRect(10, y - 16, tw, 15);
         ctx.fillStyle = '#60a5fa';
         ctx.fillText(lbl, 15, y - 4.5);
         ctx.restore();
-        drawAxisTag(y, p1Top, p1Top + p1H, s.p.toFixed(2), '#1d4ed8', '#ffffff');
       }}
     }});
     (c.meta.res || []).forEach((r, rIdx) => {{
@@ -4244,14 +4442,13 @@ function drawUmwaChart() {{
         ctx.lineWidth = rIdx === 0 ? 1.8 : 1.3;
         ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
         const lbl = '🔵 RES ' + r.p.toFixed(2) + '$ (' + r.b + 'T/' + r.v + 'P)';
-        ctx.font = 'bold 10px "SF Mono", Menlo, monospace';
+        ctx.font = 'bold 10.5px "SF Mono", Menlo, monospace';
         const tw = ctx.measureText(lbl).width + 10;
-        ctx.fillStyle = 'rgba(15, 23, 42, 0.86)';
-        ctx.fillRect(10, y + 2, tw, 14);
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+        ctx.fillRect(10, y + 2, tw, 15);
         ctx.fillStyle = '#38bdf8';
-        ctx.fillText(lbl, 15, y + 12.5);
+        ctx.fillText(lbl, 15, y + 13);
         ctx.restore();
-        drawAxisTag(y, p1Top, p1Top + p1H, r.p.toFixed(2), '#0369a1', '#ffffff');
       }}
     }});
   }}
@@ -4265,29 +4462,29 @@ function drawUmwaChart() {{
       const clr = isPut ? '#10b981' : '#f43f5e';
       ctx.save();
       ctx.strokeStyle = clr;
-      ctx.lineWidth = 1.6;
+      ctx.lineWidth = 1.7;
       ctx.setLineDash([6, 4]);
       ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
       const lbl = (opt.sh ? '🛡️ ' : '') + opt.t + ' STRIKE ' + opt.k.toFixed(2) + '$ (Δ ' + (opt.d || 0).toFixed(2) + ' · +' + (opt.pr || 0).toFixed(2) + '%)';
-      ctx.font = 'bold 10px "SF Mono", Menlo, monospace';
+      ctx.font = 'bold 10.5px "SF Mono", Menlo, monospace';
       const tw = ctx.measureText(lbl).width + 10;
-      ctx.fillStyle = 'rgba(6, 78, 59, 0.88)';
-      ctx.fillRect(plotW - tw - 12, y - 15, tw, 14);
+      ctx.fillStyle = 'rgba(6, 78, 59, 0.90)';
+      ctx.fillRect(plotW - tw - 12, y - 16, tw, 15);
       ctx.fillStyle = '#6ee7b7';
       ctx.fillText(lbl, plotW - tw - 7, y - 4.5);
       ctx.restore();
-      drawAxisTag(y, p1Top, p1Top + p1H, opt.k.toFixed(2), '#059669', '#ffffff');
     }}
   }}
 
-  // 1e. Candlesticks (1 Jahr Tageskerzen)
-  for (let i = 0; i < n; i++) {{
+  // 1e. Candlesticks (Sichtbarer Ausschnitt)
+  for (let i = iStart; i <= iEnd; i++) {{
     const x = xOf(i);
+    if (x < -barW || x > plotW + barW) continue;
     const o = c.opens[i], h = c.highs[i], l = c.lows[i], cl = c.closes[i];
     const isBull = cl >= o;
     const clr = isBull ? '#10b981' : '#f43f5e';
     ctx.strokeStyle = clr;
-    ctx.lineWidth = 1.15;
+    ctx.lineWidth = barW > 6 ? 1.4 : 1.15;
     ctx.beginPath();
     ctx.moveTo(x, yOfP1(h));
     ctx.lineTo(x, yOfP1(l));
@@ -4300,28 +4497,39 @@ function drawUmwaChart() {{
     ctx.fillRect(x - barW * 0.5, yTop, barW, bh);
   }}
 
-  // Aktuelle Schlusskurs-Linie + Tag rechts
-  const lastC = c.closes[n - 1];
-  const lastOpen = c.opens[n - 1];
+  // Aktuelle Schlusskurs-Linie
+  const lastC = c.closes[total - 1];
+  const lastOpen = c.opens[total - 1];
   const yLast = yOfP1(lastC);
   ctx.save();
   ctx.strokeStyle = lastC >= lastOpen ? 'rgba(16, 185, 129, 0.5)' : 'rgba(244, 63, 94, 0.5)';
   ctx.setLineDash([2, 2]);
   ctx.beginPath(); ctx.moveTo(0, yLast); ctx.lineTo(plotW, yLast); ctx.stroke();
   ctx.restore();
+
+  ctx.restore(); // Ende Clip Pane 1
+
+  // Rechte Achsen-Tags für S/R, Strike & Aktuellen Schlusskurs
+  if (chartLayers.sr) {{
+    (c.meta.sup || []).forEach(s => drawAxisTag(yOfP1(s.p), p1Top, p1Top + p1H, s.p.toFixed(2), '#1d4ed8', '#ffffff'));
+    (c.meta.res || []).forEach(r => drawAxisTag(yOfP1(r.p), p1Top, p1Top + p1H, r.p.toFixed(2), '#0369a1', '#ffffff'));
+  }}
+  if (chartLayers.opt && c.meta.opt && c.meta.opt.k) {{
+    drawAxisTag(yOfP1(c.meta.opt.k), p1Top, p1Top + p1H, c.meta.opt.k.toFixed(2), '#059669', '#ffffff');
+  }}
   drawAxisTag(yLast, p1Top, p1Top + p1H, lastC.toFixed(2), lastC >= lastOpen ? '#10b981' : '#f43f5e', '#04130d');
 
   // Top-Left Legende Pane 1 (wie TradingView "BB & EMAs")
-  ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, "SF Mono", monospace';
-  let lx = 10, ly = p1Top + 16;
+  ctx.font = 'bold 11.5px -apple-system, BlinkMacSystemFont, "SF Mono", monospace';
+  let lx = 10, ly = p1Top + 17;
   ctx.fillStyle = '#94a3b8';
-  ctx.fillText('BB & EMAs', lx, ly); lx += 68;
+  ctx.fillText('BB & EMAs', lx, ly); lx += 72;
   const drawLegVal = (val, clr) => {{
     if (val == null) return;
     const s = val.toFixed(2);
     ctx.fillStyle = clr;
     ctx.fillText(s, lx, ly);
-    lx += ctx.measureText(s).width + 8;
+    lx += ctx.measureText(s).width + 9;
   }};
   drawLegVal(c.bbMid[idx], '#38bdf8');
   drawLegVal(c.bbUpper[idx], '#22d3ee');
@@ -4330,6 +4538,15 @@ function drawUmwaChart() {{
   drawLegVal(c.ema50[idx], '#f43f5e');
   drawLegVal(c.ema100[idx], '#3b82f6');
   drawLegVal(c.ema200[idx], '#d946ef');
+
+  // Dezenter Bedien-Hinweis oben rechts in Pane 1
+  const zoomHint = 'Mausrad/Pinch: Zoom · Ziehen: Verschieben · Preisachse ziehen: Y-Skala · Doppelklick: Auto';
+  ctx.font = '10px -apple-system, BlinkMacSystemFont, sans-serif';
+  const zhw = ctx.measureText(zoomHint).width;
+  if (plotW - zhw - 16 > lx + 20) {{
+    ctx.fillStyle = 'rgba(148, 163, 184, 0.55)';
+    ctx.fillText(zoomHint, plotW - zhw - 12, p1Top + 16);
+  }}
 
   // ===================================================================
   // PANE 2: STOCHASTIK UMWA (DUAL: KURZ 14,5,3 & LANG 50,6,5)
@@ -4344,22 +4561,25 @@ function drawUmwaChart() {{
     const y = yOfP2(lvl);
     ctx.strokeStyle = lvl === 50 ? 'rgba(51, 65, 85, 0.4)' : 'rgba(100, 116, 139, 0.45)';
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
-    ctx.fillStyle = '#64748b'; ctx.font = '10px "SF Mono", monospace';
+    ctx.fillStyle = '#64748b'; ctx.font = '10.5px "SF Mono", monospace';
     ctx.fillText(lvl.toFixed(0), plotW + 6, y + 3);
   }});
 
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, p2Top, plotW, p2H); ctx.clip();
   drawCurve(c.stLongD, yOfP2, '#3b82f6', 1.35);
   drawCurve(c.stLongK, yOfP2, '#22c55e', 1.45);
   drawCurve(c.stShortD, yOfP2, '#38bdf8', 1.25);
   drawCurve(c.stShortK, yOfP2, '#ef4444', 1.55);
+  ctx.restore();
 
-  if (c.stLongK[n - 1] != null) drawAxisTag(yOfP2(c.stLongK[n - 1]), p2Top, p2Top + p2H, c.stLongK[n - 1].toFixed(1), '#16a34a');
-  if (c.stShortK[n - 1] != null) drawAxisTag(yOfP2(c.stShortK[n - 1]), p2Top, p2Top + p2H, c.stShortK[n - 1].toFixed(1), '#dc2626');
+  if (c.stLongK[total - 1] != null) drawAxisTag(yOfP2(c.stLongK[total - 1]), p2Top, p2Top + p2H, c.stLongK[total - 1].toFixed(1), '#16a34a');
+  if (c.stShortK[total - 1] != null) drawAxisTag(yOfP2(c.stShortK[total - 1]), p2Top, p2Top + p2H, c.stShortK[total - 1].toFixed(1), '#dc2626');
 
-  lx = 10; ly = p2Top + 15;
-  ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, "SF Mono", monospace';
+  lx = 10; ly = p2Top + 16;
+  ctx.font = 'bold 11.5px -apple-system, BlinkMacSystemFont, "SF Mono", monospace';
   ctx.fillStyle = '#94a3b8';
-  ctx.fillText('Stochastik UMWA', lx, ly); lx += 106;
+  ctx.fillText('Stochastik UMWA', lx, ly); lx += 110;
   drawLegVal(c.stShortK[idx], '#ef4444');
   drawLegVal(c.stShortD[idx], '#38bdf8');
   drawLegVal(c.stLongK[idx], '#22c55e');
@@ -4380,17 +4600,20 @@ function drawUmwaChart() {{
   ctx.beginPath(); ctx.moveTo(0, yRsi70); ctx.lineTo(plotW, yRsi70); ctx.stroke();
   ctx.strokeStyle = 'rgba(244, 63, 94, 0.55)';
   ctx.beginPath(); ctx.moveTo(0, yRsi30); ctx.lineTo(plotW, yRsi30); ctx.stroke();
-  ctx.fillStyle = '#64748b'; ctx.font = '10px "SF Mono", monospace';
+  ctx.fillStyle = '#64748b'; ctx.font = '10.5px "SF Mono", monospace';
   ctx.fillText('70', plotW + 6, yRsi70 + 3);
   ctx.fillText('30', plotW + 6, yRsi30 + 3);
 
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, p3Top, plotW, p3H); ctx.clip();
   drawCurve(c.rsi, yOfP3, '#d946ef', 1.75);
-  if (c.rsi[n - 1] != null) drawAxisTag(yOfP3(c.rsi[n - 1]), p3Top, p3Top + p3H, c.rsi[n - 1].toFixed(2), '#c026d3');
+  ctx.restore();
+  if (c.rsi[total - 1] != null) drawAxisTag(yOfP3(c.rsi[total - 1]), p3Top, p3Top + p3H, c.rsi[total - 1].toFixed(2), '#c026d3');
 
-  lx = 10; ly = p3Top + 15;
-  ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, "SF Mono", monospace';
+  lx = 10; ly = p3Top + 16;
+  ctx.font = 'bold 11.5px -apple-system, BlinkMacSystemFont, "SF Mono", monospace';
   ctx.fillStyle = '#94a3b8';
-  ctx.fillText('RSI UMWA', lx, ly); lx += 68;
+  ctx.fillText('RSI UMWA', lx, ly); lx += 72;
   drawLegVal(c.rsi[idx], '#d946ef');
 
   // ===================================================================
@@ -4400,7 +4623,7 @@ function drawUmwaChart() {{
   ctx.beginPath(); ctx.moveTo(0, p4Top); ctx.lineTo(W, p4Top); ctx.stroke();
 
   let maxM = 0.001;
-  for (let i = 0; i < n; i++) {{
+  for (let i = iStart; i <= iEnd; i++) {{
     if (c.macdHist[i] != null && Math.abs(c.macdHist[i]) > maxM) maxM = Math.abs(c.macdHist[i]);
   }}
   maxM *= 1.15;
@@ -4409,7 +4632,9 @@ function drawUmwaChart() {{
   ctx.strokeStyle = 'rgba(100, 116, 139, 0.45)';
   ctx.beginPath(); ctx.moveTo(0, yZero); ctx.lineTo(plotW, yZero); ctx.stroke();
 
-  for (let i = 0; i < n; i++) {{
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, p4Top, plotW, p4H); ctx.clip();
+  for (let i = iStart; i <= iEnd; i++) {{
     const v = c.macdHist[i];
     if (v == null) continue;
     const prevV = i > 0 && c.macdHist[i - 1] != null ? c.macdHist[i - 1] : 0;
@@ -4417,19 +4642,21 @@ function drawUmwaChart() {{
     if (v >= 0) mClr = (v >= prevV) ? '#22c55e' : '#86efac';
     else mClr = (v <= prevV) ? '#ef4444' : '#fca5a5';
     const x = xOf(i);
+    if (x < -barW || x > plotW + barW) continue;
     const y = yOfP4(v);
     ctx.fillStyle = mClr;
     ctx.fillRect(x - barW * 0.45, Math.min(y, yZero), Math.max(1.2, barW * 0.9), Math.max(1.0, Math.abs(y - yZero)));
   }}
-  const lastM = c.macdHist[n - 1];
+  ctx.restore();
+  const lastM = c.macdHist[total - 1];
   if (lastM != null) {{
     drawAxisTag(yOfP4(lastM), p4Top, p4Top + p4H, lastM.toFixed(4), lastM >= 0 ? '#16a34a' : '#dc2626');
   }}
 
-  lx = 10; ly = p4Top + 15;
-  ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, "SF Mono", monospace';
+  lx = 10; ly = p4Top + 16;
+  ctx.font = 'bold 11.5px -apple-system, BlinkMacSystemFont, "SF Mono", monospace';
   ctx.fillStyle = '#94a3b8';
-  ctx.fillText('MACD UMWA', lx, ly); lx += 82;
+  ctx.fillText('MACD UMWA', lx, ly); lx += 86;
   if (c.macdHist[idx] != null) {{
     ctx.fillStyle = c.macdHist[idx] >= 0 ? '#22c55e' : '#f43f5e';
     ctx.fillText(c.macdHist[idx].toFixed(4), lx, ly);
@@ -4442,58 +4669,315 @@ function drawUmwaChart() {{
   ctx.moveTo(plotW, 0); ctx.lineTo(plotW, H);
   ctx.stroke();
 
-  // Synchronisiertes Fadenkreuz (Crosshair)
-  if (hoverBarIdx != null && hoverBarIdx >= 0 && hoverBarIdx < n) {{
-    const cx = xOf(hoverBarIdx);
-    ctx.save();
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.55)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, plotH); ctx.stroke();
-    ctx.restore();
+  // "AUTO" Badge auf der Preisachse unten rechts (wie in TradingView)
+  const isAutoY = (Math.abs(tvPriceZoom - 1.0) < 0.01 && Math.abs(tvPricePanPx) < 1.0);
+  ctx.fillStyle = isAutoY ? 'rgba(56, 189, 248, 0.22)' : 'rgba(30, 41, 59, 0.85)';
+  ctx.fillRect(plotW + 8, p1H - 20, axisW - 16, 16);
+  ctx.fillStyle = isAutoY ? '#38bdf8' : '#94a3b8';
+  ctx.font = 'bold 9.5px "SF Mono", monospace';
+  ctx.fillText('AUTO', plotW + 22, p1H - 8.5);
 
-    const dtStr = c.dates[hoverBarIdx];
-    ctx.font = 'bold 10.5px "SF Mono", monospace';
-    const dw = ctx.measureText(dtStr).width + 14;
-    const dx = Math.max(4, Math.min(plotW - dw - 4, cx - dw * 0.5));
-    ctx.fillStyle = '#1e293b';
-    ctx.fillRect(dx, plotH + 3, dw, 18);
-    ctx.fillStyle = '#f8fafc';
-    ctx.fillText(dtStr, dx + 7, plotH + 15.5);
+  // Synchronisiertes 2D-Fadenkreuz (Crosshair vertikal + horizontal mit Preis-Tag wie in TradingView)
+  if (hoverBarIdx != null && hoverBarIdx >= 0 && hoverBarIdx < total) {{
+    const cx = xOf(hoverBarIdx);
+    if (cx >= 0 && cx <= plotW) {{
+      ctx.save();
+      ctx.strokeStyle = 'rgba(148, 163, 184, 0.6)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(cx, 0);
+      ctx.lineTo(cx, plotH);
+      if (hoverRelY != null && hoverRelY >= 0 && hoverRelY <= plotH) {{
+        ctx.moveTo(0, hoverRelY);
+        ctx.lineTo(plotW, hoverRelY);
+      }}
+      ctx.stroke();
+      ctx.restore();
+
+      if (hoverRelY != null && hoverRelY >= p1Top && hoverRelY <= p1Top + p1H) {{
+        const curP = priceOfY1(hoverRelY);
+        if (isFinite(curP)) {{
+          drawAxisTag(hoverRelY, p1Top, p1Top + p1H, curP.toFixed(2), '#334155', '#f8fafc');
+        }}
+      }}
+
+      const dtStr = c.dates[hoverBarIdx];
+      ctx.font = 'bold 11px "SF Mono", monospace';
+      const dw = ctx.measureText(dtStr).width + 14;
+      const dx = Math.max(4, Math.min(plotW - dw - 4, cx - dw * 0.5));
+      ctx.fillStyle = '#1e293b';
+      ctx.fillRect(dx, plotH + 3, dw, 19);
+      ctx.fillStyle = '#f8fafc';
+      ctx.fillText(dtStr, dx + 7, plotH + 16);
+    }}
   }}
 }}
 
-// Interaktive Maus- & Touch-Steuerung für das 4-Pane-Chart + Pfeiltasten für Watchlist
+// TradingView-Haptik: Mausrad/Trackpad-Zoom (am Cursor verankert), Click-Drag-Panning,
+// Preisachsen-Skalierung (Rechts), Zeitachsen-Drag (Unten), Touch-Pinch & Doppelklick-Reset
 (function initChartInteractions() {{
   const canvas = document.getElementById('umwaChartCanvas');
   if (!canvas) return;
 
-  const updateHoverFromClientX = (clientX) => {{
+  let dragMode = null; // 'pan' | 'y_axis' | 'x_axis'
+  let dragStartX = 0;
+  let dragStartY = 0;
+  let dragStartViewStart = 0;
+  let dragStartViewEnd = 0;
+  let dragStartPriceZoom = 1.0;
+  let dragStartPricePan = 0.0;
+  let touchPinchDist = null;
+  let touchPinchSpan = null;
+  let touchPinchAnchorBar = null;
+  let touchPinchRatio = 0.5;
+
+  const updateHover = (clientX, clientY) => {{
     if (!cachedChartCalc) return;
     const rect = canvas.getBoundingClientRect();
-    const plotW = rect.width - 76;
+    const axisW = 78, timeH = 26;
+    const plotW = rect.width - axisW;
+    const plotH = rect.height - timeH;
     const relX = clientX - rect.left;
-    if (relX < 0 || relX > plotW) {{
-      hoverBarIdx = null;
+    const relY = clientY - rect.top;
+
+    // Cursor-Form je nach Bereich wie in TradingView anpassen
+    if (!dragMode) {{
+      if (relX >= plotW && relY < plotH) canvas.style.cursor = 'ns-resize';
+      else if (relY >= plotH && relX < plotW) canvas.style.cursor = 'ew-resize';
+      else canvas.style.cursor = 'crosshair';
+    }}
+
+    if (relX < 0 || relX > plotW || relY < 0 || relY > plotH) {{
+      if (hoverBarIdx !== null || hoverRelY !== null) {{
+        hoverBarIdx = null;
+        hoverRelX = null;
+        hoverRelY = null;
+        drawUmwaChart();
+      }}
+      return;
+    }}
+
+    const total = cachedChartCalc.closes.length;
+    clampChartViewport(total);
+    const visSpan = Math.max(5, tvViewEnd - tvViewStart);
+    const rawIdx = tvViewStart + ((relX - 8) / Math.max(10, plotW - 16)) * visSpan - 0.5;
+    const idx = Math.max(0, Math.min(total - 1, Math.round(rawIdx)));
+    hoverBarIdx = idx;
+    hoverRelX = relX;
+    hoverRelY = relY;
+    drawUmwaChart();
+  }};
+
+  // 1. Mausrad & Trackpad (Zoom am Mauszeiger + 2-Finger-Horizontal-Swipe)
+  canvas.addEventListener('wheel', e => {{
+    if (!cachedChartCalc) return;
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const plotW = rect.width - 78;
+    const relX = e.clientX - rect.left;
+    const total = cachedChartCalc.closes.length;
+    clampChartViewport(total);
+
+    // Mausrad auf der rechten Preisachse -> Vertikale Y-Skalierung
+    if (relX >= plotW) {{
+      const zFactor = Math.exp(-e.deltaY * 0.0025);
+      tvPriceZoom = Math.max(0.25, Math.min(5.0, tvPriceZoom * zFactor));
       drawUmwaChart();
       return;
     }}
-    const n = cachedChartCalc.closes.length;
-    const idx = Math.max(0, Math.min(n - 1, Math.floor(((relX - 8) / (plotW - 16)) * n)));
-    if (idx !== hoverBarIdx) {{
-      hoverBarIdx = idx;
+
+    const curSpan = tvViewEnd - tvViewStart;
+    // 2-Finger-Horizontal-Swipe auf dem Mac-Trackpad -> Sanftes Verschieben (Panning)
+    if (!e.ctrlKey && Math.abs(e.deltaX) > Math.abs(e.deltaY) * 1.15) {{
+      const shiftBars = (e.deltaX / Math.max(50, plotW - 16)) * curSpan;
+      tvViewStart += shiftBars;
+      tvViewEnd += shiftBars;
+      clampChartViewport(total);
+      updateHover(e.clientX, e.clientY);
+      return;
+    }}
+
+    // Vertikales Mausrad oder Trackpad-Pinch -> Rein-/Rauszoomen exakt an der Mausposition
+    const focusRatio = Math.max(0.0, Math.min(1.0, (relX - 8) / Math.max(20, plotW - 16)));
+    const anchorBar = tvViewStart + focusRatio * curSpan;
+    const speed = e.ctrlKey ? 0.011 : 0.0028;
+    const factor = Math.exp(e.deltaY * speed);
+    const minSpan = Math.min(14, total);
+    const maxSpan = total;
+    const newSpan = Math.max(minSpan, Math.min(maxSpan, curSpan * factor));
+    tvViewStart = anchorBar - focusRatio * newSpan;
+    tvViewEnd = tvViewStart + newSpan;
+    clampChartViewport(total);
+    updateHover(e.clientX, e.clientY);
+  }}, {{ passive: false }});
+
+  // 2. Click & Drag (Pan im Chart, Skalieren auf Preisachse & Zeitachse)
+  canvas.addEventListener('mousedown', e => {{
+    if (!cachedChartCalc || e.button !== 0) return;
+    const rect = canvas.getBoundingClientRect();
+    const plotW = rect.width - 78;
+    const plotH = rect.height - 26;
+    const p1H = Math.floor(plotH * 0.50);
+    const relX = e.clientX - rect.left;
+    const relY = e.clientY - rect.top;
+
+    // Klick auf den "AUTO" Button unten auf der Preisachse
+    if (relX >= plotW && relY >= p1H - 24 && relY <= p1H) {{
+      tvPriceZoom = 1.0;
+      tvPricePanPx = 0.0;
+      drawUmwaChart();
+      return;
+    }}
+
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    dragStartViewStart = tvViewStart;
+    dragStartViewEnd = tvViewEnd;
+    dragStartPriceZoom = tvPriceZoom;
+    dragStartPricePan = tvPricePanPx;
+
+    if (relX >= plotW && relY < plotH) {{
+      dragMode = 'y_axis';
+      canvas.style.cursor = 'ns-resize';
+    }} else if (relY >= plotH && relX < plotW) {{
+      dragMode = 'x_axis';
+      canvas.style.cursor = 'ew-resize';
+    }} else {{
+      dragMode = 'pan';
+      canvas.style.cursor = 'grabbing';
+    }}
+  }});
+
+  window.addEventListener('mousemove', e => {{
+    if (!dragMode || !cachedChartCalc) return;
+    const rect = canvas.getBoundingClientRect();
+    const plotW = Math.max(60, rect.width - 78);
+    const total = cachedChartCalc.closes.length;
+    const dx = e.clientX - dragStartX;
+    const dy = e.clientY - dragStartY;
+
+    if (dragMode === 'pan') {{
+      const span = dragStartViewEnd - dragStartViewStart;
+      const shiftBars = -(dx / (plotW - 16)) * span;
+      tvViewStart = dragStartViewStart + shiftBars;
+      tvViewEnd = dragStartViewEnd + shiftBars;
+      if (Math.abs(tvPriceZoom - 1.0) > 0.01 || Math.abs(tvPricePanPx) > 0.5 || e.shiftKey) {{
+        tvPricePanPx = dragStartPricePan + dy;
+      }}
+      clampChartViewport(total);
+      drawUmwaChart();
+    }} else if (dragMode === 'y_axis') {{
+      const zFactor = Math.exp(-dy * 0.006);
+      tvPriceZoom = Math.max(0.25, Math.min(5.0, dragStartPriceZoom * zFactor));
+      drawUmwaChart();
+    }} else if (dragMode === 'x_axis') {{
+      const span = dragStartViewEnd - dragStartViewStart;
+      const zFactor = Math.exp(dx * 0.005);
+      const minSpan = Math.min(14, total);
+      const newSpan = Math.max(minSpan, Math.min(total, span * zFactor));
+      tvViewEnd = dragStartViewEnd;
+      tvViewStart = tvViewEnd - newSpan;
+      clampChartViewport(total);
       drawUmwaChart();
     }}
-  }};
+  }});
 
-  canvas.addEventListener('mousemove', e => updateHoverFromClientX(e.clientX));
-  canvas.addEventListener('mouseleave', () => {{ hoverBarIdx = null; drawUmwaChart(); }});
+  window.addEventListener('mouseup', () => {{
+    if (dragMode) {{
+      dragMode = null;
+      canvas.style.cursor = 'crosshair';
+    }}
+  }});
+
+  canvas.addEventListener('mousemove', e => {{
+    if (!dragMode) updateHover(e.clientX, e.clientY);
+  }});
+
+  canvas.addEventListener('mouseleave', () => {{
+    if (!dragMode) {{
+      hoverBarIdx = null;
+      hoverRelX = null;
+      hoverRelY = null;
+      drawUmwaChart();
+    }}
+  }});
+
+  // Doppelklick -> Automatische Skalierung / Reset wie in TradingView
+  canvas.addEventListener('dblclick', e => {{
+    if (!cachedChartCalc) return;
+    const rect = canvas.getBoundingClientRect();
+    const plotW = rect.width - 78;
+    const relX = e.clientX - rect.left;
+    if (relX >= plotW) {{
+      tvPriceZoom = 1.0;
+      tvPricePanPx = 0.0;
+      drawUmwaChart();
+    }} else {{
+      resetChartView();
+    }}
+  }});
+
+  // 3. Touch-Steuerung für iPad & iPhone (1-Finger-Pan + 2-Finger-Pinch-Zoom)
   canvas.addEventListener('touchstart', e => {{
-    if (e.touches && e.touches[0]) updateHoverFromClientX(e.touches[0].clientX);
-  }}, {{ passive: true }});
+    if (!cachedChartCalc) return;
+    const total = cachedChartCalc.closes.length;
+    clampChartViewport(total);
+    if (e.touches.length === 2) {{
+      e.preventDefault();
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      touchPinchDist = Math.hypot(dx, dy);
+      touchPinchSpan = tvViewEnd - tvViewStart;
+      const rect = canvas.getBoundingClientRect();
+      const plotW = Math.max(60, rect.width - 78);
+      const midX = (e.touches[0].clientX + e.touches[1].clientX) * 0.5 - rect.left;
+      touchPinchRatio = Math.max(0.0, Math.min(1.0, (midX - 8) / (plotW - 16)));
+      touchPinchAnchorBar = tvViewStart + touchPinchRatio * touchPinchSpan;
+      dragMode = null;
+    }} else if (e.touches.length === 1) {{
+      dragMode = 'pan';
+      dragStartX = e.touches[0].clientX;
+      dragStartY = e.touches[0].clientY;
+      dragStartViewStart = tvViewStart;
+      dragStartViewEnd = tvViewEnd;
+      updateHover(e.touches[0].clientX, e.touches[0].clientY);
+    }}
+  }}, {{ passive: false }});
+
   canvas.addEventListener('touchmove', e => {{
-    if (e.touches && e.touches[0]) updateHoverFromClientX(e.touches[0].clientX);
-  }}, {{ passive: true }});
+    if (!cachedChartCalc) return;
+    const total = cachedChartCalc.closes.length;
+    if (e.touches.length === 2 && touchPinchDist > 10) {{
+      e.preventDefault();
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const dist = Math.hypot(dx, dy);
+      const factor = touchPinchDist / Math.max(10, dist);
+      const minSpan = Math.min(14, total);
+      const newSpan = Math.max(minSpan, Math.min(total, touchPinchSpan * factor));
+      tvViewStart = touchPinchAnchorBar - touchPinchRatio * newSpan;
+      tvViewEnd = tvViewStart + newSpan;
+      clampChartViewport(total);
+      drawUmwaChart();
+    }} else if (e.touches.length === 1 && dragMode === 'pan') {{
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const plotW = Math.max(60, rect.width - 78);
+      const dx = e.touches[0].clientX - dragStartX;
+      const span = dragStartViewEnd - dragStartViewStart;
+      const shiftBars = -(dx / (plotW - 16)) * span;
+      tvViewStart = dragStartViewStart + shiftBars;
+      tvViewEnd = dragStartViewEnd + shiftBars;
+      clampChartViewport(total);
+      updateHover(e.touches[0].clientX, e.touches[0].clientY);
+    }}
+  }}, {{ passive: false }});
+
+  canvas.addEventListener('touchend', () => {{
+    dragMode = null;
+    touchPinchDist = null;
+  }});
 
   window.addEventListener('resize', () => {{
     if (document.getElementById('view-charts').style.display !== 'none') drawUmwaChart();
@@ -4513,6 +4997,25 @@ function drawUmwaChart() {{
       selectChartSymbol(next);
       const activeRow = document.querySelector('#tvWlList .tv-wl-row.active');
       if (activeRow) activeRow.scrollIntoView({{ block: 'nearest' }});
+    }} else if (e.key === '+' || e.key === '=') {{
+      e.preventDefault();
+      zoomChartBy(0.78);
+    }} else if (e.key === '-' || e.key === '_') {{
+      e.preventDefault();
+      zoomChartBy(1.28);
+    }} else if (e.key === '0') {{
+      e.preventDefault();
+      resetChartView();
+    }} else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {{
+      if (!cachedChartCalc) return;
+      e.preventDefault();
+      const total = cachedChartCalc.closes.length;
+      clampChartViewport(total);
+      const step = Math.max(2, (tvViewEnd - tvViewStart) * 0.12) * (e.key === 'ArrowLeft' ? -1 : 1);
+      tvViewStart += step;
+      tvViewEnd += step;
+      clampChartViewport(total);
+      drawUmwaChart();
     }}
   }});
 }})();

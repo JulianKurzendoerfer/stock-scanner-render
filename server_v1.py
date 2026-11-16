@@ -27,20 +27,73 @@ BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
 PORT = int(os.environ.get("PORT", os.environ.get("V1_PORT", "8765")))
 
+from datetime import datetime
+
 TUNNEL_PROC = None
 PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL") or "https://version-1-umwa.onrender.com"
+IS_RENDER_CLOUD = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL"))
 REFRESH_LOCK = threading.Lock()
+CLOUD_SYNC_LOCK = threading.Lock()
 IS_REFRESHING = False
 LAST_REFRESH_OK = True
 LAST_REFRESH_TS = int(time.time())
+LAST_DURATION_SEC = 0.0
+LAST_CLOUD_SYNC_TS = 0
 REFRESH_START_TS = 0
 
 
+def _sync_to_cloud_worker():
+    """
+    Hybrid-Turbo (Option 1):
+    Pusht das auf dem M1 Mac mini fertig berechnete Dashboard im Hintergrund
+    zu GitHub (Branch version-1) -> Render aktualisiert sich automatisch weltweit.
+    """
+    global LAST_CLOUD_SYNC_TS
+    if IS_RENDER_CLOUD:
+        return
+    with CLOUD_SYNC_LOCK:
+        try:
+            git_dir = BASE_DIR / ".git"
+            if not git_dir.exists():
+                return
+            subprocess.run(
+                ["git", "add", "Version_1_App.html", "Stillhalter_Dashboard.html"],
+                cwd=str(BASE_DIR),
+                capture_output=True,
+                timeout=20,
+            )
+            diff_res = subprocess.run(
+                ["git", "diff", "--cached", "--quiet"],
+                cwd=str(BASE_DIR),
+                capture_output=True,
+                timeout=10,
+            )
+            if diff_res.returncode != 0:
+                ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                subprocess.run(
+                    ["git", "commit", "-m", f"Auto-Sync Mac mini M1 Scan ({ts_str})"],
+                    cwd=str(BASE_DIR),
+                    capture_output=True,
+                    timeout=20,
+                )
+                push_res = subprocess.run(
+                    ["git", "push", "origin", "version-1"],
+                    cwd=str(BASE_DIR),
+                    capture_output=True,
+                    timeout=45,
+                )
+                if push_res.returncode == 0:
+                    LAST_CLOUD_SYNC_TS = int(time.time())
+        except Exception:
+            pass
+
+
 def _run_refresh_worker():
-    global IS_REFRESHING, LAST_REFRESH_OK, LAST_REFRESH_TS, REFRESH_START_TS
+    global IS_REFRESHING, LAST_REFRESH_OK, LAST_REFRESH_TS, REFRESH_START_TS, LAST_DURATION_SEC
     with REFRESH_LOCK:
         IS_REFRESHING = True
-        REFRESH_START_TS = int(time.time())
+        t0 = time.time()
+        REFRESH_START_TS = int(t0)
         try:
             python_bin = BASE_DIR / "venv" / "bin" / "python"
             if not python_bin.exists():
@@ -61,10 +114,37 @@ def _run_refresh_worker():
                     pass
             LAST_REFRESH_OK = (res.returncode == 0)
             LAST_REFRESH_TS = int(time.time())
+            LAST_DURATION_SEC = round(time.time() - t0, 2)
+            if LAST_REFRESH_OK and not IS_RENDER_CLOUD:
+                threading.Thread(target=_sync_to_cloud_worker, daemon=True).start()
         except Exception:
             LAST_REFRESH_OK = False
         finally:
             IS_REFRESHING = False
+
+
+def _market_scheduler_loop():
+    """
+    24/7 Hintergrund-Planer auf dem Mac mini:
+    Scannt an Handelstagen (Mo–Fr) automatisch zu den Kernzeiten (09:00, 15:35 US-Open,
+    17:30, 20:00, 22:05 US-Close) und synchronisiert das Ergebnis zu Render/GitHub.
+    """
+    if IS_RENDER_CLOUD:
+        return
+    schedule_slots = {"09:00", "15:35", "17:30", "20:00", "22:05"}
+    triggered_key = ""
+    while True:
+        try:
+            now = datetime.now()
+            if now.weekday() < 5:  # Mo (0) bis Fr (4)
+                hm = now.strftime("%H:%M")
+                slot_key = f"{now.strftime('%Y-%m-%d')}_{hm}"
+                if hm in schedule_slots and slot_key != triggered_key:
+                    triggered_key = slot_key
+                    trigger_async_refresh()
+        except Exception:
+            pass
+        time.sleep(30)
 
 
 def trigger_async_refresh() -> bool:
@@ -251,12 +331,15 @@ class Version1Handler(http.server.BaseHTTPRequestHandler):
             resp = {
                 "ok": True,
                 "version": "Version 1",
+                "host": "render-cloud" if IS_RENDER_CLOUD else "mac-mini-m1",
                 "lan_url": f"http://{lan_ip}:{PORT}",
                 "public_url": ext_url,
                 "refreshing": IS_REFRESHING,
                 "elapsed_sec": elapsed,
                 "last_refresh_ok": LAST_REFRESH_OK,
                 "last_refresh_ts": LAST_REFRESH_TS,
+                "last_duration_sec": LAST_DURATION_SEC,
+                "last_cloud_sync_ts": LAST_CLOUD_SYNC_TS,
             }
             payload = json.dumps(resp).encode("utf-8")
             self.send_response(200)
@@ -303,11 +386,14 @@ class ThreadedHTTPServer(http.server.ThreadingHTTPServer):
 
 
 def main():
+    if not IS_RENDER_CLOUD:
+        threading.Thread(target=_market_scheduler_loop, daemon=True).start()
     lan_ip = get_lan_ip()
     server = ThreadedHTTPServer(("0.0.0.0", PORT), Version1Handler)
     print(f"Version 1 Live-Server aktiv auf:")
-    print(f"  MacBook:      http://localhost:{PORT}")
-    print(f"  iPad / Handy: http://{lan_ip}:{PORT}")
+    print(f"  Mac mini (Lokal): http://localhost:{PORT}")
+    print(f"  iPad / Handy LAN: http://{lan_ip}:{PORT}")
+    print(f"  Global Cloud Sync: {PUBLIC_URL}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
