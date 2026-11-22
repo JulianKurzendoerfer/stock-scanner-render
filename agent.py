@@ -554,74 +554,129 @@ def find_validated_sr_lines(
     candles: list,
     pivot_left: int = 5,
     pivot_right: int = 5,
-    tol_pct: float = 0.007,
+    tol_pct: float = 0.0075,
 ) -> dict:
     """
-    Findet und validiert horizontale Support- und Resistance-Linien in 2 Stufen:
-    Stufe 1: Echte Swing-Pivots (Hochs & Tiefs) über bis zu 2 Jahre sammeln und clustern
-             (Mindestabstand 6 Handelstage zwischen zwei Punkten desselben Clusters).
-    Stufe 2 (Doppel-Check):
-      a) Prüft an allen Kerzen, wie oft die Linie exakt angelaufen und per Schlusskurs
-         respektiert wurde (unabhängige Abpraller / Touches mit mind. 5 Tagen Abstand).
-      b) Whipsaw-Filter: Wurde die Linie in den letzten 25 Kerzen ständig durchsägt
-         (> 3 glatte Schlusskurs-Kreuzungen), wird sie als 'zersägt / invalide' aussortiert!
-      c) Nur Linien mit mind. 2 unabhängigen Swing-Pivots (oder >= 3 sauberen Abprallern)
-         gelten als VALIDE LINIE.
+    Findet und validiert horizontale Support- und Resistance-Linien in 2 Horizonten:
+      1. Major Multi-Pivot S/R-Linien (über bis zu 2 Jahre, mehrfach getestet & bestätigt)
+      2. Kurzfristige Swing-Tops & Swing-Lows (letzte 65 Handelstage / 1M–3M Wendepunkte &
+         Range-Kanten mit klarer Umkehr-Reaktion, die seit ihrer Entstehung gehalten haben).
+    Inklusive ATR-adaptiver Cluster-Toleranz, Whipsaw-Filter und Mindestabstands-Entdopplung,
+    damit im Chart sowohl die großen strukturellen Marken als auch die wichtigen kurzfristigen
+    Tops und Lows exakt wie in TradingView eingezeichnet werden.
     """
     if not candles or len(candles) < 60:
         return {"supports": [], "resistances": [], "nearest_support": None, "nearest_resistance": None, "at_support": False, "at_resistance": False}
 
     n = len(candles)
-    current_price = candles[-1]["close"]
+    current_price = float(candles[-1]["close"])
 
-    # --- Stufe 1: Lokale Swing-Pivots finden ---
+    # Durchschnittliche Tages-Spanne (ATR-Prozent) der letzten 30 Tage für adaptive Toleranz
+    recent_30 = candles[-30:]
+    atr_pct = sum((c["high"] - c["low"]) / max(c["close"], 1e-4) for c in recent_30) / len(recent_30)
+    eff_tol = max(tol_pct, min(0.013, atr_pct * 0.42))
+    bounce_tol = max(0.0055, min(0.0095, atr_pct * 0.32))
+    min_line_gap = max(0.009, min(0.016, atr_pct * 0.48))
+
+    # --- Stufe 1: Lokale Swing-Pivots finden (Major 5L/5R + Kurzfristig 3L/2R in den letzten 75 Tagen) ---
     raw_pivots = []
     for i in range(pivot_left, n - pivot_right):
-        lo = candles[i]["low"]
-        hi = candles[i]["high"]
+        lo = float(candles[i]["low"])
+        hi = float(candles[i]["high"])
         is_low = all(candles[j]["low"] >= lo for j in range(i - pivot_left, i + pivot_right + 1))
         is_high = all(candles[j]["high"] <= hi for j in range(i - pivot_left, i + pivot_right + 1))
         if is_low:
-            raw_pivots.append({"idx": i, "price": float(lo), "kind": "L", "time": candles[i]["time"]})
+            raw_pivots.append({"idx": i, "price": lo, "kind": "L", "time": candles[i]["time"], "major": True})
         if is_high:
-            raw_pivots.append({"idx": i, "price": float(hi), "kind": "H", "time": candles[i]["time"]})
+            raw_pivots.append({"idx": i, "price": hi, "kind": "H", "time": candles[i]["time"], "major": True})
 
-    # Relevanter Preisbereich: +/- 35% um den aktuellen Kurs
-    lo_bound = current_price * 0.65
-    hi_bound = current_price * 1.35
+    # Kurzfristige Swing-Pivots der letzten 80 Handelstage (3L/2R sowie 2L/1R für die jüngsten 20 Tage!)
+    st_start = max(3, n - 80)
+    for i in range(st_start, n - 1):
+        lo = float(candles[i]["low"])
+        hi = float(candles[i]["high"])
+        left_w = 2 if i >= n - 20 else 3
+        right_w = 1 if i >= n - 12 else 2
+        if i + right_w >= n:
+            continue
+        is_st_low = all(candles[j]["low"] >= lo for j in range(max(0, i - left_w), min(n, i + right_w + 1)))
+        is_st_high = all(candles[j]["high"] <= hi for j in range(max(0, i - left_w), min(n, i + right_w + 1)))
+        if is_st_low and not any(p["idx"] == i and p["kind"] == "L" for p in raw_pivots):
+            raw_pivots.append({"idx": i, "price": lo, "kind": "L", "time": candles[i]["time"], "major": False})
+        if is_st_high and not any(p["idx"] == i and p["kind"] == "H" for p in raw_pivots):
+            raw_pivots.append({"idx": i, "price": hi, "kind": "H", "time": candles[i]["time"], "major": False})
+
+    # Explizite 1-Monats (22T) und 3-Monats (65T) Range-Tops & Range-Lows ergänzen,
+    # damit markante kurzfristige Hochs und Tiefs niemals übersehen werden:
+    for win_len in (22, 65):
+        if n > win_len + 2:
+            w_slice = candles[n - win_len : n - 1]
+            if w_slice:
+                min_idx = min(range(n - win_len, n - 1), key=lambda k: candles[k]["low"])
+                max_idx = max(range(n - win_len, n - 1), key=lambda k: candles[k]["high"])
+                lo_v = float(candles[min_idx]["low"])
+                hi_v = float(candles[max_idx]["high"])
+                if not any(abs(p["idx"] - min_idx) <= 2 and p["kind"] == "L" for p in raw_pivots):
+                    raw_pivots.append({"idx": min_idx, "price": lo_v, "kind": "L", "time": candles[min_idx]["time"], "major": False})
+                if not any(abs(p["idx"] - max_idx) <= 2 and p["kind"] == "H" for p in raw_pivots):
+                    raw_pivots.append({"idx": max_idx, "price": hi_v, "kind": "H", "time": candles[max_idx]["time"], "major": False})
+
+    # Relevanter Preisbereich: +/- 38% um den aktuellen Kurs
+    lo_bound = current_price * 0.62
+    hi_bound = current_price * 1.38
     raw_pivots = [p for p in raw_pivots if lo_bound <= p["price"] <= hi_bound]
 
-    # Clustern von nahe beieinander liegenden Pivots (Mindestabstand 6 Kerzen für unabhängigen Test)
-    raw_pivots.sort(key=lambda x: x["price"])
+    # Clustern von nahe beieinander liegenden Pivots (Mindestabstand 4 Kerzen für unabhängigen Test)
+    # Jüngere Pivots zuerst sortieren, damit der Cluster-Anker exakt am aktuellen/jüngsten Swing-Level liegt
+    raw_pivots.sort(key=lambda x: (-x["idx"], x["price"]))
     clusters = []
     for p in raw_pivots:
         placed = False
         for c in clusters:
             mid = c["sum"] / c["count"]
-            if abs(p["price"] - mid) / mid <= tol_pct:
-                # Nur als neuen unabhängigen Pivot zählen, wenn mind. 6 Handelstage zu bisherigen Punkten liegen
-                if all(abs(p["idx"] - existing_idx) >= 6 for existing_idx in c["indices"]):
-                    c["sum"] += p["price"]
-                    c["count"] += 1
+            if abs(p["price"] - mid) / mid <= eff_tol:
+                if all(abs(p["idx"] - existing_idx) >= 4 for existing_idx in c["indices"]):
+                    # Jüngere Punkte stärker gewichten, damit die Linie präzise am aktuellen Top/Low sitzt
+                    w = 1.35 if p["idx"] >= n - 65 else 1.0
+                    c["sum"] += p["price"] * w
+                    c["count"] += w
+                    c["raw_count"] += 1
                     c["indices"].append(p["idx"])
                     c["times"].append(p["time"])
+                    if p["idx"] > c["last_idx"]:
+                        c["last_idx"] = p["idx"]
+                        c["recent_price"] = p["price"]
                 placed = True
                 break
         if not placed:
+            w = 1.35 if p["idx"] >= n - 65 else 1.0
             clusters.append({
-                "sum": p["price"],
-                "count": 1,
+                "sum": p["price"] * w,
+                "count": w,
+                "raw_count": 1,
                 "indices": [p["idx"]],
                 "times": [p["time"]],
+                "last_idx": p["idx"],
+                "recent_price": p["price"],
+                "kind": p["kind"],
             })
 
-    # --- Stufe 2: Doppel-Check (Abpraller-Prüfung & Whipsaw-Filter) ---
+    # --- Stufe 2: Doppel-Check (Multi-Touch + Kurzfristige Swing-Tops & -Lows) ---
     validated_supports = []
     validated_resistances = []
 
     for c in clusters:
         lvl = c["sum"] / c["count"]
-        pivot_touches = c["count"]
+        pivot_touches = c["raw_count"]
+        last_p_idx = c["last_idx"]
+        is_recent_swing = (last_p_idx >= n - 80)
+
+        # Bei einem frischen kurzfristigen Top/Low exakt das jüngste Swing-Extrem als Linienpreis verwenden,
+        # damit die horizontale Linie im Chart haarfein auf der Kerzenspitze des Tops/Lows liegt!
+        if is_recent_swing and pivot_touches == 1:
+            lvl = float(c["recent_price"])
+        elif is_recent_swing and pivot_touches == 2:
+            lvl = 0.70 * float(c["recent_price"]) + 0.30 * lvl
 
         # Doppel-Check A: Zähle unabhängige Kerzen-Abpraller (Touch & Hold) an dieser Linie
         bounce_indices = []
@@ -629,53 +684,74 @@ def find_validated_sr_lines(
             hi, lo, cl, op = candles[i]["high"], candles[i]["low"], candles[i]["close"], candles[i]["open"]
             body_lo, body_hi = min(op, cl), max(op, cl)
 
-            # Hat die Kerze die Linie innerhalb von 0.55% berührt, ohne sie mit dem Körper massiv zu durchbrechen?
-            touched_as_support = (abs(lo - lvl) / lvl <= 0.0055 or (lo < lvl and body_lo >= lvl * 0.996)) and cl >= lvl * 0.997
-            touched_as_resist = (abs(hi - lvl) / lvl <= 0.0055 or (hi > lvl and body_hi <= lvl * 1.004)) and cl <= lvl * 1.003
+            touched_as_support = (abs(lo - lvl) / lvl <= bounce_tol or (lo < lvl and body_lo >= lvl * (1.0 - bounce_tol * 0.75))) and cl >= lvl * (1.0 - bounce_tol * 0.55)
+            touched_as_resist = (abs(hi - lvl) / lvl <= bounce_tol or (hi > lvl and body_hi <= lvl * (1.0 + bounce_tol * 0.75))) and cl <= lvl * (1.0 + bounce_tol * 0.55)
 
             if touched_as_support or touched_as_resist:
-                if not bounce_indices or (i - bounce_indices[-1]) >= 5:
+                if not bounce_indices or (i - bounce_indices[-1]) >= 3:
                     bounce_indices.append(i)
 
-        total_confirmations = max(pivot_touches, len(bounce_indices))
-
-        # Doppel-Check B: Whipsaw-Filter (Wurde die Linie in den letzten 25 Tagen ständig durchsägt?)
-        recent_slice = candles[-25:] if n >= 25 else candles
+        # Doppel-Check B: Whipsaw-Filter
+        check_start = max(n - 18, last_p_idx + 1) if is_recent_swing else max(0, n - 25)
+        recent_slice = candles[check_start:]
         crossings = 0
         for k in range(1, len(recent_slice)):
             c_prev = recent_slice[k - 1]["close"]
             c_curr = recent_slice[k]["close"]
-            if (c_prev < lvl * 0.996 and c_curr > lvl * 1.004) or (c_prev > lvl * 1.004 and c_curr < lvl * 0.996):
+            if (c_prev < lvl * 0.995 and c_curr > lvl * 1.005) or (c_prev > lvl * 1.005 and c_curr < lvl * 0.995):
                 crossings += 1
 
-        # Strikter Doppel-Check für eine ECHTE, VALIDE Linie:
-        # 1) MUSS mindestens 2 unabhängige historische Swing-Pivots (echte Trend-Wendepunkte!) haben
-        # 2) MUSS zusätzlich mindestens 3 unabhängige Kerzen-Abpraller (Touch & Hold) aufweisen
-        # 3) Darf in den letzten 25 Tagen nicht durchsägt worden sein (crossings <= 2)
         if crossings > 2:
             continue
-        is_valid = (pivot_touches >= 2) and (len(bounce_indices) >= 3)
-        if not is_valid:
+
+        # Prüfung 1: Klassische mehrfach bestätigte Struktur-Linie (2J)
+        is_valid_major = (pivot_touches >= 2 and len(bounce_indices) >= 2) or (pivot_touches >= 1 and len(bounce_indices) >= 3)
+
+        # Prüfung 2: Wichtiges kurzfristiges Top oder Low (letzte 80 Handelstage)
+        is_valid_short_term = False
+        if is_recent_swing and crossings <= 1:
+            after_bars = candles[last_p_idx:]
+            near_bars = candles[max(0, last_p_idx - 4) : min(n, last_p_idx + 8)]
+            if after_bars and near_bars:
+                max_near = max(b["high"] for b in near_bars)
+                min_near = min(b["low"] for b in near_bars)
+                rebound_pct = max(abs(max_near - lvl), abs(lvl - min_near), abs(current_price - lvl)) / max(lvl, 1e-4)
+                min_rebound = max(0.012, atr_pct * 0.90)
+                if rebound_pct >= min_rebound:
+                    is_valid_short_term = True
+
+        if not (is_valid_major or is_valid_short_term):
             continue
 
+        bounces_cnt = max(len(bounce_indices), pivot_touches)
+        recency_bonus = 4 if last_p_idx >= n - 35 else (2 if last_p_idx >= n - 80 else 0)
         line_info = {
             "price": round(lvl, 2),
             "pivots": pivot_touches,
-            "bounces": len(bounce_indices),
-            "strength": pivot_touches * 2 + len(bounce_indices),
+            "bounces": bounces_cnt,
+            "horizon": "short" if (is_valid_short_term and not is_valid_major) else "major",
+            "strength": pivot_touches * 2 + bounces_cnt + recency_bonus,
             "dist_pct": round((lvl - current_price) / current_price * 100.0, 2),
         }
 
-        # Klare Trennung: Support liegt UNTER dem aktuellen Kurs, Widerstand liegt ÜBER dem aktuellen Kurs
-        if lvl < current_price:
+        if lvl < current_price * 0.9995:
             validated_supports.append(line_info)
-        elif lvl > current_price:
+        elif lvl > current_price * 1.0005:
             validated_resistances.append(line_info)
 
-    # Sortiere Supports absteigend (nächster unter dem Kurs zuerst)
-    validated_supports.sort(key=lambda x: -x["price"])
-    # Sortiere Resistances aufsteigend (nächster über dem Kurs zuerst)
-    validated_resistances.sort(key=lambda x: x["price"])
+    # Entdoppeln: Wenn zwei Linien extrem nah beieinander liegen (< min_line_gap),
+    # behalte die stärkere / aktuellere Linie, damit im Chart keine Doppellinien kleben
+    def _dedup_lines(lines: list, reverse_sort: bool) -> list:
+        lines_by_strength = sorted(lines, key=lambda x: (-x["strength"], abs(x["dist_pct"])))
+        kept = []
+        for cand in lines_by_strength:
+            if all(abs(cand["price"] - k["price"]) / max(k["price"], 1e-4) >= min_line_gap for k in kept):
+                kept.append(cand)
+        kept.sort(key=lambda x: (-x["price"] if reverse_sort else x["price"]))
+        return kept
+
+    validated_supports = _dedup_lines(validated_supports, reverse_sort=True)
+    validated_resistances = _dedup_lines(validated_resistances, reverse_sort=False)
 
     nearest_sup = validated_supports[0] if validated_supports else None
     nearest_res = validated_resistances[0] if validated_resistances else None
@@ -701,8 +777,8 @@ def find_validated_sr_lines(
             break
 
     return {
-        "supports": validated_supports[:5],
-        "resistances": validated_resistances[:5],
+        "supports": validated_supports[:7],
+        "resistances": validated_resistances[:7],
         "nearest_support": nearest_sup,
         "nearest_resistance": nearest_res,
         "at_support": at_support,
@@ -2734,8 +2810,8 @@ def export_html_dashboard(results: list, html_path: str):
             "bear": r.get("bearish_count", 0),
             "es": r.get("ema_seeds") or [],
             "c": flat_c,
-            "sup": [{"p": s["price"], "b": s["bounces"], "v": s["pivots"], "d": s["dist_pct"]} for s in (sr.get("supports") or [])[:5]],
-            "res": [{"p": s["price"], "b": s["bounces"], "v": s["pivots"], "d": s["dist_pct"]} for s in (sr.get("resistances") or [])[:5]],
+            "sup": [{"p": s["price"], "b": s["bounces"], "v": s["pivots"], "d": s["dist_pct"], "h": s.get("horizon", "major")} for s in (sr.get("supports") or [])[:7]],
+            "res": [{"p": s["price"], "b": s["bounces"], "v": s["pivots"], "d": s["dist_pct"], "h": s.get("horizon", "major")} for s in (sr.get("resistances") or [])[:7]],
             "opt": opt_compact,
             "ind": {
                 "bb": (ind.get("BB") or {}).get("dir", 0),
@@ -4700,39 +4776,91 @@ function drawUmwaChart() {{
     drawCurve(c.ema20, yOfP1, '#facc15', 1.45);
   }}
 
-  // 1c. Horizontale Support- & Widerstandslinien (Blaue Linien)
+  // 1c. Horizontale Support- & Widerstandslinien (Blaue Linien: Major Struktur + Kurzfristige Swing-Tops & -Lows)
+  const activeSup = (c.meta.sup || []).map(x => Object.assign({{}}, x));
+  const activeRes = (c.meta.res || []).map(x => Object.assign({{}}, x));
+  const curClose = c.closes[total - 1];
+  const allExistingPrices = () => activeSup.map(x => x.p).concat(activeRes.map(x => x.p));
+  const isNearExisting = (pVal) => allExistingPrices().some(ep => Math.abs(ep - pVal) / Math.max(ep, 0.01) < 0.0085);
+
+  // Dynamische Erkennung sichtbarer kurzfristiger Tops & Lows im aktuellen Chart-Ausschnitt
+  const scanFrom = Math.max(2, iStart + 1);
+  const scanTo = Math.min(total - 2, iEnd);
+  const localCand = [];
+  for (let i = scanFrom; i <= scanTo; i++) {{
+    const lo = c.lows[i], hi = c.highs[i];
+    const lw = (i >= total - 18) ? 2 : 3;
+    const rw = (i >= total - 12) ? 1 : 2;
+    let isL = true, isH = true;
+    for (let j = Math.max(0, i - lw); j <= Math.min(total - 1, i + rw); j++) {{
+      if (c.lows[j] < lo) isL = false;
+      if (c.highs[j] > hi) isH = false;
+    }}
+    if (isL) localCand.push({{ p: lo, idx: i, kind: 'L' }});
+    if (isH) localCand.push({{ p: hi, idx: i, kind: 'H' }});
+  }}
+  // Jüngste sichtbare Swing-Tops & -Lows zuerst prüfen
+  localCand.sort((a, b) => b.idx - a.idx);
+  localCand.forEach(pt => {{
+    if (!isNearExisting(pt.p) && Math.abs(pt.p - curClose) / Math.max(curClose, 0.01) >= 0.004) {{
+      const entry = {{ p: pt.p, b: 1, v: 1, h: 'short', d: ((pt.p - curClose) / curClose) * 100.0 }};
+      if (pt.p < curClose && activeSup.length < 8) activeSup.push(entry);
+      else if (pt.p > curClose && activeRes.length < 8) activeRes.push(entry);
+    }}
+  }});
+  activeSup.sort((a, b) => b.p - a.p);
+  activeRes.sort((a, b) => a.p - b.p);
+
   if (chartLayers.sr) {{
-    (c.meta.sup || []).forEach((s, sIdx) => {{
+    const usedLabelY = [];
+    const pickLabelX = (yVal) => {{
+      let slot = 0;
+      for (const prev of usedLabelY) {{
+        if (Math.abs(prev.y - yVal) < 17 && prev.slot === slot) slot = (slot + 1) % 3;
+      }}
+      usedLabelY.push({{ y: yVal, slot }});
+      return 10 + slot * 165;
+    }};
+
+    activeSup.forEach((s, sIdx) => {{
       const y = yOfP1(s.p);
       if (y >= p1Top + 4 && y <= p1Top + p1H - 4) {{
+        const isShort = (s.h === 'short' && s.v <= 1);
         ctx.save();
-        ctx.strokeStyle = sIdx === 0 ? '#2563eb' : 'rgba(59, 130, 246, 0.75)';
-        ctx.lineWidth = sIdx === 0 ? 2.0 : 1.4;
+        ctx.strokeStyle = sIdx === 0 ? '#2563eb' : (isShort ? 'rgba(96, 165, 250, 0.82)' : 'rgba(59, 130, 246, 0.78)');
+        ctx.lineWidth = sIdx === 0 ? 2.1 : 1.45;
+        if (isShort && sIdx > 0) ctx.setLineDash([5, 3]);
         ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
-        const lbl = '🔵 SUP ' + s.p.toFixed(2) + '$ (' + s.b + 'T/' + s.v + 'P)';
+        const tagInfo = isShort ? 'Kurzfr. Low' : (s.b + 'T/' + s.v + 'P');
+        const lbl = '🔵 SUP ' + s.p.toFixed(2) + '$ (' + tagInfo + ')';
         ctx.font = 'bold 10.5px "SF Mono", Menlo, monospace';
         const tw = ctx.measureText(lbl).width + 10;
-        ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
-        ctx.fillRect(10, y - 16, tw, 15);
+        const lxPos = pickLabelX(y - 9);
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.90)';
+        ctx.fillRect(lxPos, y - 16, tw, 15);
         ctx.fillStyle = '#60a5fa';
-        ctx.fillText(lbl, 15, y - 4.5);
+        ctx.fillText(lbl, lxPos + 5, y - 4.5);
         ctx.restore();
       }}
     }});
-    (c.meta.res || []).forEach((r, rIdx) => {{
+    activeRes.forEach((r, rIdx) => {{
       const y = yOfP1(r.p);
       if (y >= p1Top + 4 && y <= p1Top + p1H - 4) {{
+        const isShort = (r.h === 'short' && r.v <= 1);
         ctx.save();
-        ctx.strokeStyle = rIdx === 0 ? '#0284c7' : 'rgba(56, 189, 248, 0.65)';
-        ctx.lineWidth = rIdx === 0 ? 1.8 : 1.3;
+        ctx.strokeStyle = rIdx === 0 ? '#0284c7' : (isShort ? 'rgba(56, 189, 248, 0.82)' : 'rgba(56, 189, 248, 0.72)');
+        ctx.lineWidth = rIdx === 0 ? 1.95 : 1.4;
+        if (isShort && rIdx > 0) ctx.setLineDash([5, 3]);
         ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
-        const lbl = '🔵 RES ' + r.p.toFixed(2) + '$ (' + r.b + 'T/' + r.v + 'P)';
+        const tagInfo = isShort ? 'Kurzfr. Top' : (r.b + 'T/' + r.v + 'P');
+        const lbl = '🔵 RES ' + r.p.toFixed(2) + '$ (' + tagInfo + ')';
         ctx.font = 'bold 10.5px "SF Mono", Menlo, monospace';
         const tw = ctx.measureText(lbl).width + 10;
-        ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
-        ctx.fillRect(10, y + 2, tw, 15);
+        const lxPos = pickLabelX(y + 9);
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.90)';
+        ctx.fillRect(lxPos, y + 2, tw, 15);
         ctx.fillStyle = '#38bdf8';
-        ctx.fillText(lbl, 15, y + 13);
+        ctx.fillText(lbl, lxPos + 5, y + 13);
         ctx.restore();
       }}
     }});
@@ -4796,8 +4924,8 @@ function drawUmwaChart() {{
 
   // Rechte Achsen-Tags für S/R, Strike & Aktuellen Schlusskurs
   if (chartLayers.sr) {{
-    (c.meta.sup || []).forEach(s => drawAxisTag(yOfP1(s.p), p1Top, p1Top + p1H, s.p.toFixed(2), '#1d4ed8', '#ffffff'));
-    (c.meta.res || []).forEach(r => drawAxisTag(yOfP1(r.p), p1Top, p1Top + p1H, r.p.toFixed(2), '#0369a1', '#ffffff'));
+    activeSup.forEach(s => drawAxisTag(yOfP1(s.p), p1Top, p1Top + p1H, s.p.toFixed(2), '#1d4ed8', '#ffffff'));
+    activeRes.forEach(r => drawAxisTag(yOfP1(r.p), p1Top, p1Top + p1H, r.p.toFixed(2), '#0369a1', '#ffffff'));
   }}
   if (chartLayers.opt && c.meta.opt && c.meta.opt.k) {{
     drawAxisTag(yOfP1(c.meta.opt.k), p1Top, p1Top + p1H, c.meta.opt.k.toFixed(2), '#059669', '#ffffff');
