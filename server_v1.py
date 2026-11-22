@@ -36,9 +36,23 @@ REFRESH_LOCK = threading.Lock()
 CLOUD_SYNC_LOCK = threading.Lock()
 POSITIONS_LOCK = threading.Lock()
 POSITIONS_FILE = BASE_DIR / "positions.json"
+def _read_initial_build_ts() -> int:
+    html_file = BASE_DIR / "Version_1_App.html"
+    if html_file.exists():
+        try:
+            txt = html_file.read_text(encoding="utf-8", errors="ignore")
+            m = re.search(r"PAGE_BUILD_TS\s*=\s*(\d+)", txt)
+            if m:
+                return int(m.group(1))
+            return int(html_file.stat().st_mtime)
+        except Exception:
+            pass
+    return int(time.time())
+
+
 IS_REFRESHING = False
 LAST_REFRESH_OK = True
-LAST_REFRESH_TS = int(time.time())
+LAST_REFRESH_TS = _read_initial_build_ts()
 LAST_DURATION_SEC = 0.0
 LAST_CLOUD_SYNC_TS = 0
 REFRESH_START_TS = 0

@@ -4303,9 +4303,9 @@ function logoutMvpUser() {{
   }} catch (err) {{}}
 }})();
 
-const MASTER_DATES = {master_dates_json};
-const CHART_ORDER = {chart_order_json};
-const CHART_DATA = {chart_data_json};
+var MASTER_DATES = {master_dates_json};
+var CHART_ORDER = {chart_order_json};
+var CHART_DATA = {chart_data_json};
 
 let currentMode = 'main';
 let sortState = {{ key: null, asc: false }};
@@ -4828,9 +4828,27 @@ async function applyRemoteHtmlUpdate(base) {{
     if (r.ok) {{
       const html = await r.text();
       if (html && html.includes('CHART_DATA')) {{
-        document.open();
-        document.write(html);
-        document.close();
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const newScanner = doc.getElementById('view-scanner');
+        const curScanner = document.getElementById('view-scanner');
+        if (newScanner && curScanner) curScanner.innerHTML = newScanner.innerHTML;
+        const newFund = doc.getElementById('view-fundamentals');
+        const curFund = document.getElementById('view-fundamentals');
+        if (newFund && curFund) curFund.innerHTML = newFund.innerHTML;
+        const mDates = html.match(/(?:var|const)\\s+MASTER_DATES\\s*=\\s*(\\[[\\s\\S]*?\\]);/);
+        const mOrder = html.match(/(?:var|const)\\s+CHART_ORDER\\s*=\\s*(\\[[\\s\\S]*?\\]);/);
+        const mData = html.match(/(?:var|const)\\s+CHART_DATA\\s*=\\s*(\{{[\\s\\S]*?\}});\\s*\\n\\s*let\\s+currentMode/);
+        if (mDates) MASTER_DATES = JSON.parse(mDates[1]);
+        if (mOrder) CHART_ORDER = JSON.parse(mOrder[1]);
+        if (mData) CHART_DATA = JSON.parse(mData[1]);
+        cachedChartCalc = null;
+        applyAllFilters();
+        updateTrackButtonsAndCount();
+        renderOpenPositions();
+        if (document.getElementById('view-charts') && document.getElementById('view-charts').style.display !== 'none') {{
+          renderWatchlistSidebar();
+          selectChartSymbol(activeChartSym);
+        }}
         return true;
       }}
     }}
@@ -5012,7 +5030,7 @@ function renderWatchlistSidebar() {{
 
 function clampChartViewport(total) {{
   if (!total || total < 1) return;
-  const minSpan = Math.min(14, total);
+  const minSpan = Math.min(10, total);
   const maxSpan = total + 8;
   if (tvViewStart == null || tvViewEnd == null || isNaN(tvViewStart) || isNaN(tvViewEnd)) {{
     tvViewStart = Math.max(0, total - chartBarsCount);
@@ -5063,11 +5081,14 @@ function setChartRange(bars, btn) {{
 }}
 
 function zoomChartBy(factor, anchorRatio = 0.82) {{
+  if (!cachedChartCalc && activeChartSym) {{
+    cachedChartCalc = computeUmwaSeries(activeChartSym);
+  }}
   if (!cachedChartCalc) return;
   const total = cachedChartCalc.closes.length;
   clampChartViewport(total);
   const curSpan = tvViewEnd - tvViewStart;
-  const minSpan = Math.min(14, total);
+  const minSpan = Math.min(10, total);
   const maxSpan = total;
   const newSpan = Math.max(minSpan, Math.min(maxSpan, curSpan * factor));
   const anchorBar = tvViewStart + anchorRatio * curSpan;
@@ -5335,7 +5356,9 @@ function selectChartSymbol(sym) {{
 
 function drawUmwaChart() {{
   const canvas = document.getElementById('umwaChartCanvas');
-  if (!canvas || !cachedChartCalc) return;
+  if (!canvas) return;
+  ensureChartInteractionsBound(canvas);
+  if (!cachedChartCalc) return;
   const rect = canvas.parentElement.getBoundingClientRect();
   if (rect.width < 50 || rect.height < 50) return;
 
@@ -5945,9 +5968,10 @@ function drawUmwaChart() {{
 
 // TradingView-Haptik: Mausrad/Trackpad-Zoom (am Cursor verankert), Click-Drag-Panning,
 // Preisachsen-Skalierung (Rechts), Zeitachsen-Drag (Unten), Touch-Pinch & Doppelklick-Reset
-(function initChartInteractions() {{
-  const canvas = document.getElementById('umwaChartCanvas');
-  if (!canvas) return;
+function ensureChartInteractionsBound(targetCanvas) {{
+  const canvas = targetCanvas || document.getElementById('umwaChartCanvas');
+  if (!canvas || canvas.__mvpZoomBound) return;
+  canvas.__mvpZoomBound = true;
 
   let dragMode = null; // 'pan' | 'y_axis' | 'x_axis'
   let dragStartX = 0;
@@ -5960,6 +5984,9 @@ function drawUmwaChart() {{
   let touchPinchSpan = null;
   let touchPinchAnchorBar = null;
   let touchPinchRatio = 0.5;
+  let gestureStartSpan = null;
+  let gestureAnchorBar = null;
+  let gestureFocusRatio = 0.5;
 
   const updateHover = (clientX, clientY) => {{
     if (!cachedChartCalc) return;
@@ -6000,26 +6027,37 @@ function drawUmwaChart() {{
 
   // 1. Mausrad & Trackpad (Zoom am Mauszeiger + 2-Finger-Horizontal-Swipe)
   canvas.addEventListener('wheel', e => {{
+    if (!cachedChartCalc && activeChartSym) cachedChartCalc = computeUmwaSeries(activeChartSym);
     if (!cachedChartCalc) return;
     e.preventDefault();
+    e.stopPropagation();
     const rect = canvas.getBoundingClientRect();
     const plotW = rect.width - 78;
     const relX = e.clientX - rect.left;
     const total = cachedChartCalc.closes.length;
     clampChartViewport(total);
 
+    // Normiere deltaY / deltaX für Trackpad, Magic Mouse & externe Mausräder
+    let dy = e.deltaY;
+    let dx = e.deltaX;
+    if (e.deltaMode === 1) {{ dy *= 24; dx *= 24; }}
+    else if (e.deltaMode === 2) {{ dy *= 240; dx *= 240; }}
+    else if (!e.ctrlKey && Math.abs(dy) > 0 && Math.abs(dy) < 8) {{
+      dy = Math.sign(dy) * Math.max(15, Math.abs(dy) * 5);
+    }}
+
     // Mausrad auf der rechten Preisachse -> Vertikale Y-Skalierung
     if (relX >= plotW) {{
-      const zFactor = Math.exp(-e.deltaY * 0.0025);
-      tvPriceZoom = Math.max(0.25, Math.min(5.0, tvPriceZoom * zFactor));
+      const zFactor = Math.exp(-dy * 0.0035);
+      tvPriceZoom = Math.max(0.20, Math.min(6.0, tvPriceZoom * zFactor));
       drawUmwaChart();
       return;
     }}
 
     const curSpan = tvViewEnd - tvViewStart;
     // 2-Finger-Horizontal-Swipe auf dem Mac-Trackpad -> Sanftes Verschieben (Panning)
-    if (!e.ctrlKey && Math.abs(e.deltaX) > Math.abs(e.deltaY) * 1.15) {{
-      const shiftBars = (e.deltaX / Math.max(50, plotW - 16)) * curSpan;
+    if (!e.ctrlKey && Math.abs(dx) > Math.abs(dy) * 1.8 && Math.abs(dx) > 3) {{
+      const shiftBars = (dx / Math.max(50, plotW - 16)) * curSpan;
       tvViewStart += shiftBars;
       tvViewEnd += shiftBars;
       clampChartViewport(total);
@@ -6027,18 +6065,52 @@ function drawUmwaChart() {{
       return;
     }}
 
+    if (Math.abs(dy) < 0.05) return;
+
     // Vertikales Mausrad oder Trackpad-Pinch -> Rein-/Rauszoomen exakt an der Mausposition
     const focusRatio = Math.max(0.0, Math.min(1.0, (relX - 8) / Math.max(20, plotW - 16)));
     const anchorBar = tvViewStart + focusRatio * curSpan;
-    const speed = e.ctrlKey ? 0.011 : 0.0028;
-    const factor = Math.exp(e.deltaY * speed);
-    const minSpan = Math.min(14, total);
+    const speed = e.ctrlKey ? 0.014 : 0.0042;
+    const factor = Math.exp(dy * speed);
+    const minSpan = Math.min(10, total);
     const maxSpan = total;
     const newSpan = Math.max(minSpan, Math.min(maxSpan, curSpan * factor));
     tvViewStart = anchorBar - focusRatio * newSpan;
     tvViewEnd = tvViewStart + newSpan;
     clampChartViewport(total);
     updateHover(e.clientX, e.clientY);
+  }}, {{ passive: false }});
+
+  // 1b. Native macOS Safari Trackpad 2-Finger-Pinch-Geste (gesturestart / gesturechange)
+  canvas.addEventListener('gesturestart', e => {{
+    if (!cachedChartCalc) return;
+    e.preventDefault();
+    const total = cachedChartCalc.closes.length;
+    clampChartViewport(total);
+    const rect = canvas.getBoundingClientRect();
+    const plotW = Math.max(60, rect.width - 78);
+    const relX = (e.clientX || (rect.left + plotW * 0.7)) - rect.left;
+    gestureStartSpan = tvViewEnd - tvViewStart;
+    gestureFocusRatio = Math.max(0.0, Math.min(1.0, (relX - 8) / (plotW - 16)));
+    gestureAnchorBar = tvViewStart + gestureFocusRatio * gestureStartSpan;
+  }}, {{ passive: false }});
+
+  canvas.addEventListener('gesturechange', e => {{
+    if (!cachedChartCalc || !gestureStartSpan) return;
+    e.preventDefault();
+    const total = cachedChartCalc.closes.length;
+    const scale = Math.max(0.15, Math.min(6.0, e.scale || 1.0));
+    const minSpan = Math.min(10, total);
+    const newSpan = Math.max(minSpan, Math.min(total, gestureStartSpan / scale));
+    tvViewStart = gestureAnchorBar - gestureFocusRatio * newSpan;
+    tvViewEnd = tvViewStart + newSpan;
+    clampChartViewport(total);
+    drawUmwaChart();
+  }}, {{ passive: false }});
+
+  canvas.addEventListener('gestureend', e => {{
+    if (e && e.preventDefault) e.preventDefault();
+    gestureStartSpan = null;
   }}, {{ passive: false }});
 
   // 2. Click & Drag (Pan im Chart, Skalieren auf Preisachse & Zeitachse)
@@ -6247,7 +6319,8 @@ function drawUmwaChart() {{
       drawUmwaChart();
     }}
   }});
-}})();
+}}
+ensureChartInteractionsBound();
 
 applyAllFilters();
 loadOpenPositions();
