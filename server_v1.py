@@ -34,6 +34,8 @@ PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL") or "https://version-1-umwa.on
 IS_RENDER_CLOUD = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL"))
 REFRESH_LOCK = threading.Lock()
 CLOUD_SYNC_LOCK = threading.Lock()
+POSITIONS_LOCK = threading.Lock()
+POSITIONS_FILE = BASE_DIR / "positions.json"
 IS_REFRESHING = False
 LAST_REFRESH_OK = True
 LAST_REFRESH_TS = int(time.time())
@@ -333,6 +335,26 @@ class Version1Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b'{"status":"ok","version":"Version 1"}')
             return
 
+        if path == "/api/positions":
+            positions = []
+            with POSITIONS_LOCK:
+                if POSITIONS_FILE.exists():
+                    try:
+                        raw = json.loads(POSITIONS_FILE.read_text(encoding="utf-8"))
+                        if isinstance(raw, list):
+                            positions = raw
+                        elif isinstance(raw, dict) and isinstance(raw.get("positions"), list):
+                            positions = raw["positions"]
+                    except Exception:
+                        positions = []
+            payload = json.dumps({"ok": True, "positions": positions}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self._send_cors()
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
         if path == "/api/status":
             lan_ip = get_lan_ip()
             ext_url = os.environ.get("RENDER_EXTERNAL_URL") or PUBLIC_URL
@@ -362,6 +384,31 @@ class Version1Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
+
+        if path == "/api/positions":
+            try:
+                clen = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(clen).decode("utf-8") if clen > 0 else "{}"
+                data = json.loads(body)
+                positions = data.get("positions", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                if not isinstance(positions, list):
+                    positions = []
+                with POSITIONS_LOCK:
+                    POSITIONS_FILE.write_text(json.dumps({"positions": positions, "updated_ts": int(time.time())}, indent=2), encoding="utf-8")
+                payload = json.dumps({"ok": True, "count": len(positions)}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self._send_cors()
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception as e:
+                payload = json.dumps({"ok": False, "error": str(e)}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self._send_cors()
+                self.end_headers()
+                self.wfile.write(payload)
+            return
 
         if path == "/api/refresh":
             trigger_async_refresh()

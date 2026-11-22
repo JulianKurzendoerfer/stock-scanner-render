@@ -93,6 +93,36 @@ DEFAULT_EODHD_KEY = "690cc04fad1308.55079017"
 # 1. LIVE-DATENQUELLEN (EODHD + Yahoo Real-Time Fusion & Fundamentaldaten)
 # =====================================================================
 
+_YAHOO_SESS = None
+_YAHOO_CRUMB = ""
+_YAHOO_TS = 0
+
+
+def _get_yahoo_session_and_crumb() -> tuple[requests.Session, str]:
+    global _YAHOO_SESS, _YAHOO_CRUMB, _YAHOO_TS
+    import time as _t
+    now = _t.time()
+    if _YAHOO_SESS is not None and _YAHOO_CRUMB and (now - _YAHOO_TS) < 1800:
+        return _YAHOO_SESS, _YAHOO_CRUMB
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+    })
+    try:
+        sess.get("https://fc.yahoo.com", timeout=6)
+        crumb_resp = sess.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=6)
+        crumb = crumb_resp.text.strip() if crumb_resp.status_code == 200 else ""
+        if crumb:
+            _YAHOO_SESS = sess
+            _YAHOO_CRUMB = crumb
+            _YAHOO_TS = now
+        return sess, crumb
+    except Exception:
+        return sess, ""
+
+
 def fetch_batch_quotes_and_fundamentals(symbols: list[str], eod_key: str = DEFAULT_EODHD_KEY) -> dict[str, dict]:
     """
     Holt für alle übergebenen Symbole in wenigen Millisekunden:
@@ -107,15 +137,7 @@ def fetch_batch_quotes_and_fundamentals(symbols: list[str], eod_key: str = DEFAU
 
     # 1. Yahoo Finance Live Batch Quote + Fundamentals (mit Crumb & Cache-Busting)
     try:
-        sess = requests.Session()
-        sess.headers.update({
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-        })
-        sess.get("https://fc.yahoo.com", timeout=6)
-        crumb_resp = sess.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=6)
-        crumb = crumb_resp.text.strip() if crumb_resp.status_code == 200 else ""
+        sess, crumb = _get_yahoo_session_and_crumb()
 
         batch_size = 80
         for idx in range(0, len(clean_syms), batch_size):
@@ -1105,6 +1127,272 @@ def recommend_weekly_option(
                             chosen["qualified"] = True
 
     return chosen
+
+
+_LIVE_OPT_CACHE: dict[str, tuple] = {}
+_LIVE_OPT_LOCK = threading.Lock()
+
+
+def _enrich_with_live_option_chain(res: dict) -> None:
+    """
+    Vorschlag 2: Echte Live-Optionskette (Bid, Ask, Mid, Spread, Open Interest, Volumen & Strike-IV)
+    Prüft über die Live-Optionskette der Börse (Yahoo Finance Option Chain API):
+      1. Existiert für diese Aktie tatsächlich eine echte Weekly-Option zum Ziel-Freitag an der Börse
+         (oder werden nur Monats-Optionen gehandelt wie z. B. bei CROX / EW)?
+      2. Welche real gelisteten Strikes erfüllen Δ <= 0,30, OTM >= 2,0% und Prämie >= 0,70%
+         anhand der echten Geld-/Briefkurse (Bid / Ask / Mid) und echten Implied Volatility?
+      3. Wie liquide ist der Kontrakt (Open Interest, Tagesvolumen, Bid-Ask-Spread)?
+    """
+    import time as _t
+    from datetime import datetime, timezone
+
+    opt = res.get("option_setup")
+    sym = res.get("symbol", "")
+    S = float(res.get("last_close") or 0.0)
+    if not opt or not sym or S <= 0:
+        return
+
+    clean_sym = sym.replace(".US", "") if sym.upper().endswith(".US") else sym
+    is_put = "PUT" in (opt.get("type") or "")
+    sr_info = res.get("sr_lines") or {}
+    try:
+        last_dt = date.fromisoformat(res.get("last_date") or date.today().isoformat())
+    except Exception:
+        last_dt = date.today()
+
+    dte_days, target_exp, cycle_label = _calc_weekly_cycle(last_dt)
+    T = max(dte_days, 1) / 252.0
+    r = 0.045
+    base_iv = max(0.15, float(opt.get("iv_pct") or 30.0) / 100.0)
+
+    now_ts = _t.time()
+    cache_key = f"{clean_sym}_{target_exp.isoformat()}_{'P' if is_put else 'C'}"
+    with _LIVE_OPT_LOCK:
+        cached = _LIVE_OPT_CACHE.get(cache_key)
+    if cached and (now_ts - cached[0]) < 180:
+        chain_data = cached[1]
+    else:
+        chain_data = None
+        try:
+            sess, crumb = _get_yahoo_session_and_crumb()
+            url = f"https://query1.finance.yahoo.com/v7/finance/options/{clean_sym}"
+            resp = sess.get(url, params={"crumb": crumb, "_t": int(now_ts)}, timeout=8)
+            if resp.status_code == 200:
+                res_list = resp.json().get("optionChain", {}).get("result", [])
+                if res_list:
+                    r0 = res_list[0]
+                    exp_ts_list = r0.get("expirationDates") or []
+                    exp_pairs = []
+                    for ts in exp_ts_list:
+                        dt = datetime.fromtimestamp(int(ts), tz=timezone.utc).date()
+                        if dt > last_dt:
+                            exp_pairs.append((int(ts), dt))
+                    if exp_pairs:
+                        exp_pairs.sort(key=lambda x: abs((x[1] - target_exp).days))
+                        best_ts, best_dt = exp_pairs[0]
+                        first_ts = exp_ts_list[0] if exp_ts_list else None
+                        if best_ts != first_ts:
+                            r2 = sess.get(url, params={"crumb": crumb, "date": best_ts, "_t": int(now_ts)}, timeout=8)
+                            if r2.status_code == 200:
+                                rl2 = r2.json().get("optionChain", {}).get("result", [])
+                                if rl2:
+                                    r0 = rl2[0]
+                        opts_arr = r0.get("options") or []
+                        if opts_arr:
+                            chain_data = {
+                                "matched_dt": best_dt.isoformat(),
+                                "days_diff": abs((best_dt - target_exp).days),
+                                "contracts": opts_arr[0].get("puts" if is_put else "calls") or [],
+                            }
+                            with _LIVE_OPT_LOCK:
+                                _LIVE_OPT_CACHE[cache_key] = (now_ts, chain_data)
+        except Exception:
+            chain_data = None
+
+    if not chain_data or not chain_data.get("contracts"):
+        opt["live_chain"] = False
+        return
+
+    matched_dt = date.fromisoformat(chain_data["matched_dt"])
+    has_weekly = (chain_data["days_diff"] <= 3)
+    contracts = chain_data["contracts"]
+    exp_code = matched_dt.strftime("%d%b%y").upper()
+    right_code = "P" if is_put else "C"
+    dte_real = max(1, (matched_dt - last_dt).days)
+    T_real = max(dte_real, 1) / 365.0
+    max_otm = 0.18 if has_weekly else 0.24
+
+    # Evaluiere alle real an der Börse gelisteten Strikes für diesen Verfall
+    qual_candidates = []
+    fallback_candidates = []
+
+    for c in contracts:
+        try:
+            K = float(c.get("strike") or 0.0)
+        except Exception:
+            continue
+        if K <= 0:
+            continue
+
+        otm_pct = (S - K) / S if is_put else (K - S) / S
+        if otm_pct < 0.0195 or otm_pct > max_otm:
+            continue
+
+        bid = float(c.get("bid") or 0.0)
+        ask = float(c.get("ask") or 0.0)
+        last_p = float(c.get("lastPrice") or 0.0)
+        oi = int(c.get("openInterest") or 0)
+        vol = int(c.get("volume") or 0)
+        raw_iv = float(c.get("impliedVolatility") or 0.0)
+
+        strike_iv = raw_iv if (0.08 <= raw_iv <= 2.30 and (bid > 0 or last_p > 0)) else base_iv
+        bs_price, delta = _bs_put(S, K, T_real, r, strike_iv) if is_put else _bs_call(S, K, T_real, r, strike_iv)
+
+        if bid > 0 and ask > 0:
+            mid = round((bid + ask) * 0.5, 2)
+            spread = round(max(0.0, ask - bid), 2)
+            spread_pct = round((spread / mid) * 100.0, 1) if mid > 0 else 0.0
+            exec_p = mid if spread_pct <= 40.0 else round(0.60 * bid + 0.40 * ask, 2)
+        elif bid > 0:
+            mid = round(bid, 2)
+            spread = 0.0
+            spread_pct = 0.0
+            exec_p = mid
+        elif last_p > 0:
+            mid = round((last_p + ask) * 0.5, 2) if (ask > 0 and ask >= last_p and (ask - last_p) / max(last_p, 0.05) <= 0.8) else round(last_p, 2)
+            spread = round(max(0.0, ask - bid), 2) if ask > 0 else 0.0
+            spread_pct = round((spread / mid) * 100.0, 1) if (mid > 0 and ask > 0) else 0.0
+            exec_p = round(last_p, 2)
+        else:
+            mid = round(bs_price, 2)
+            spread = round(max(0.0, ask - bid), 2) if ask > 0 else 0.0
+            spread_pct = 100.0 if ask > 0 else 0.0
+            exec_p = round(bs_price, 2)
+
+        prem_pct = (exec_p / K) * 100.0 if is_put else (exec_p / S) * 100.0
+        bid_pct = (bid / K) * 100.0 if (is_put and bid > 0) else ((bid / S) * 100.0 if bid > 0 else 0.0)
+
+        # Prüfe S/R-Linien-Schutz für diesen realen Strike
+        sr_prot = False
+        sr_shield = None
+        if is_put:
+            prot = [s for s in sr_info.get("supports", []) if K <= s["price"] <= S]
+            if prot:
+                sr_prot = True
+                sr_shield = max(prot, key=lambda x: x["strength"])
+        else:
+            prot = [r_l for r_l in sr_info.get("resistances", []) if S <= r_l["price"] <= K]
+            if prot:
+                sr_prot = True
+                sr_shield = max(prot, key=lambda x: x["strength"])
+
+        if (oi >= 50 or vol >= 20) and (bid > 0 and spread_pct <= 38.0):
+            liq_label = "LIQUIDE"
+        elif (oi >= 8 or vol >= 3) and (bid > 0 or last_p > 0):
+            liq_label = "NORMAL"
+        else:
+            liq_label = "DÜNN"
+
+        entry = {
+            "K": round(K, 2),
+            "contract": f"{clean_sym} {exp_code} {K:g} {right_code}",
+            "occ_symbol": c.get("contractSymbol", ""),
+            "otm_pct": round(otm_pct * 100.0, 2),
+            "premium_usd": round(exec_p, 2),
+            "prem_pct": round(prem_pct, 2),
+            "bid": round(bid, 2),
+            "ask": round(ask, 2),
+            "mid": round(mid, 2),
+            "last_opt": round(last_p, 2),
+            "bid_pct": round(bid_pct, 2),
+            "spread": round(spread, 2),
+            "spread_pct": round(spread_pct, 1),
+            "open_interest": oi,
+            "volume": vol,
+            "liq_label": liq_label,
+            "delta": round(delta, 2),
+            "iv_pct": round(strike_iv * 100.0, 1),
+            "sr_protected": sr_prot,
+            "sr_shield_line": sr_shield,
+        }
+
+        if delta <= 0.305:
+            fallback_candidates.append(entry)
+            if 0.08 <= delta <= 0.305 and prem_pct >= 0.65 and (bid > 0 or last_p > 0):
+                qual_candidates.append(entry)
+
+    if not has_weekly:
+        # Die Aktie hat an der Börse KEINE Weekly-Option für diesen Freitag, sondern nur Monats-Optionen!
+        # Wir zeigen trotzdem den besten realen Monats-Kontrakt der Börse transparent an:
+        pool_m = qual_candidates if qual_candidates else fallback_candidates
+        opt["live_chain"] = True
+        opt["has_weekly"] = False
+        opt["next_real_exp"] = matched_dt.strftime("%d.%m.%Y")
+        opt["qualified"] = False
+        if pool_m:
+            pool_m.sort(key=lambda x: (
+                0 if x["sr_protected"] else 1,
+                0 if x["liq_label"] in ("LIQUIDE", "NORMAL") else 1,
+                abs(x["delta"] - 0.22),
+            ))
+            best_m = pool_m[0]
+            opt.update(best_m)
+            opt["strike"] = best_m["K"]
+            opt["has_card"] = True
+            opt["dte"] = dte_real
+            opt["exp_iso"] = matched_dt.isoformat()
+            opt["cycle_label"] = f"Fr, {matched_dt.strftime('%d.%m.')} ({dte_real}T Monats-Opt.)"
+            opt["note"] = f"NUR MONATS-OPTION GELISTET (Verfall {matched_dt.strftime('%d.%m.%Y')} · Bid {best_m['bid']:.2f}$ / Ask {best_m['ask']:.2f}$)"
+        else:
+            opt["has_card"] = False
+            opt["note"] = f"Keine Weekly an der Börse gelistet (nur Monats-Optionen · nächster Verfall {matched_dt.strftime('%d.%m.%Y')})"
+        return
+
+    if qual_candidates:
+        # Sortierung: 1) S/R-geschützt zuerst, 2) Im Zielkorridor 0.70%–1.55% mit echtem Bid > 0, 3) Kleineres Delta (weiter OTM)
+        qual_candidates.sort(key=lambda x: (
+            0 if x["sr_protected"] else 1,
+            0 if (0.70 <= x["prem_pct"] <= 1.55 and x["bid"] > 0) else 1,
+            0 if x["liq_label"] in ("LIQUIDE", "NORMAL") else 1,
+            x["delta"],
+        ))
+        best = qual_candidates[0]
+        opt.update(best)
+        opt["strike"] = best["K"]
+        opt["qualified"] = True
+        opt["has_card"] = True
+        opt["live_chain"] = True
+        opt["has_weekly"] = True
+        opt["dte"] = dte_real
+        opt["exp_iso"] = matched_dt.isoformat()
+        opt["note"] = f"LIVE-KETTE (Bid {best['bid']:.2f}$ / Ask {best['ask']:.2f}$ · OI {best['open_interest']} · Vol {best['volume']})"
+    elif fallback_candidates:
+        fallback_candidates.sort(key=lambda x: (0 if x["sr_protected"] else 1, -x["prem_pct"]))
+        best_fb = fallback_candidates[0]
+        opt.update(best_fb)
+        opt["strike"] = best_fb["K"]
+        opt["qualified"] = False
+        opt["has_card"] = True
+        opt["live_chain"] = True
+        opt["has_weekly"] = True
+        opt["dte"] = dte_real
+        opt["exp_iso"] = matched_dt.isoformat()
+        opt["note"] = (
+            f"Live-Prämie unter 0,70% (Bid {best_fb['bid']:.2f}$ / Ask {best_fb['ask']:.2f}$ -> "
+            f"+{best_fb['prem_pct']:.2f}% bei Strike {best_fb['K']:g}$ / Δ {best_fb['delta']:.2f})"
+        )
+
+
+def _enrich_signals_with_live_options(results: list) -> None:
+    sig_items = [
+        r for r in results
+        if r.get("signal_level") in ("STRONG_BUY", "STRONG_SELL", "WEAK_BUY", "WEAK_SELL")
+        and r.get("option_setup")
+    ]
+    if not sig_items:
+        return
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        list(pool.map(_enrich_with_live_option_chain, sig_items))
 
 
 # =====================================================================
@@ -2228,6 +2516,9 @@ def scan_symbols(symbols: list, period: str = "d", only_signals: bool = False):
     if period == "d":
         _save_candle_cache()
 
+    # Live-Optionsketten (Bid / Ask / Spread / Open Interest / Volumen & Weekly-Check) für alle aktiven Signale abrufen
+    _enrich_signals_with_live_options(results)
+
     priority = {"STRONG_BUY": 0, "STRONG_SELL": 1, "WEAK_BUY": 2, "WEAK_SELL": 3, "NEUTRAL": 4, "INACTIVE": 5}
     results.sort(key=lambda r: (
         priority.get(r.get("signal_level", "NEUTRAL"), 9),
@@ -2310,20 +2601,24 @@ def scan_symbols(symbols: list, period: str = "d", only_signals: bool = False):
 
             opt = res.get("option_setup")
             if opt:
-                if opt["qualified"]:
+                if opt["qualified"] or opt.get("has_card"):
                     sign = "-" if "PUT" in opt["type"] else "+"
                     shield = ""
                     if opt.get("sr_protected") and opt.get("sr_shield_line"):
                         sl = opt["sr_shield_line"]
                         shield = f" | S/R-SHIELD {sl['price']:.2f}$ ({sl['bounces']}T)"
                     earn_w = " | [!] EARNINGS-RISIKO" if opt.get("earnings_risk") else ""
+                    live_info = ""
+                    if opt.get("live_chain"):
+                        tag_prefix = "LIVE" if opt.get("has_weekly", True) else "MONATS-OPT. LIVE"
+                        live_info = f" | {tag_prefix} Bid/Ask {opt.get('bid', 0):.2f}$/{opt.get('ask', 0):.2f}$ (OI {opt.get('open_interest', 0)}/Vol {opt.get('volume', 0)})"
                     print(
-                        f"      [WEEKLY OPTION] {opt.get('contract', opt['type'])} ({opt.get('cycle_label', '')}) | "
+                        f"      [OPTION SETUP] {opt.get('contract', opt['type'])} ({opt.get('cycle_label', '')}) | "
                         f"Strike {opt['strike']:.2f}$ ({sign}{opt['otm_pct']:.1f}% OTM) | "
-                        f"Delta {opt['delta']:.2f} | Prämie {opt['premium_usd']:.2f}$ (+{opt['prem_pct']:.2f}%){shield}{earn_w}"
+                        f"Delta {opt['delta']:.2f} | Prämie {opt['premium_usd']:.2f}$ (+{opt['prem_pct']:.2f}%){live_info}{shield}{earn_w}"
                     )
                 else:
-                    print(f"      [WEEKLY OPTION] KEIN TRADE – {opt['note']}")
+                    print(f"      [OPTION SETUP] KEIN TRADE – {opt['note']}")
 
     strong_buys = [r for r in results if r.get("signal_level") == "STRONG_BUY"]
     strong_sells = [r for r in results if r.get("signal_level") == "STRONG_SELL"]
@@ -2563,13 +2858,14 @@ def export_html_dashboard(results: list, html_path: str):
             )
         sr_cell = "".join(sr_items) if sr_items else '<span class="txt-muted">Keine validierte Linie im Fokus</span>'
 
-        # Option Cell
-        if is_opt_qual:
+        # Option Cell (mit Live-Optionskette: Bid/Ask, Spread, Open Interest, Volumen & + Überwachen Button)
+        has_opt_card = bool(is_opt_qual or (opt and opt.get("has_card") and opt.get("strike")))
+        if has_opt_card:
             sign = "-" if "PUT" in opt["type"] else "+"
             opt_cls = "opt-card-put" if "PUT" in opt["type"] else "opt-card-call"
             type_badge_cls = "opt-badge-put" if "PUT" in opt["type"] else "opt-badge-call"
             shield_html = ""
-            if is_shielded and opt.get("sr_shield_line"):
+            if bool(opt.get("sr_protected")) and opt.get("sr_shield_line"):
                 sl = opt["sr_shield_line"]
                 shield_html = (
                     f'<div class="shield-banner">'
@@ -2580,26 +2876,70 @@ def export_html_dashboard(results: list, html_path: str):
             if opt.get("earnings_risk"):
                 earn_warn_html = '<div class="opt-earn-warn">ACHTUNG: Quartalszahlen vor/nahe Verfall!</div>'
 
+            live_chain_badge = ""
+            live_metrics_extra = ""
+            if opt.get("live_chain"):
+                if opt.get("has_weekly") is False:
+                    live_chain_badge = (
+                        f'<span class="mono" style="font-size:9.5px;background:rgba(245,158,11,0.16);'
+                        f'color:#fbbf24;border:1px solid rgba(245,158,11,0.35);padding:1.5px 5px;border-radius:3px;font-weight:800">'
+                        f'🗓️ NUR MONATS-OPT.</span>'
+                    )
+                elif not is_opt_qual:
+                    live_chain_badge = (
+                        f'<span class="mono" style="font-size:9.5px;background:rgba(245,158,11,0.14);'
+                        f'color:#fbbf24;border:1px solid rgba(245,158,11,0.3);padding:1.5px 5px;border-radius:3px;font-weight:800">'
+                        f'🟡 LIVE · PRÄMIE &lt;0,7%</span>'
+                    )
+                else:
+                    liq = opt.get("liq_label", "NORMAL")
+                    liq_clr = "#10b981" if liq == "LIQUIDE" else ("#38bdf8" if liq == "NORMAL" else "#f59e0b")
+                    live_chain_badge = (
+                        f'<span class="mono" style="font-size:9.5px;background:rgba(16,185,129,0.14);'
+                        f'color:{liq_clr};border:1px solid rgba(16,185,129,0.3);padding:1.5px 5px;border-radius:3px;font-weight:800">'
+                        f'🟢 LIVE · {esc(liq)}</span>'
+                    )
+                b_v = opt.get("bid", 0.0)
+                a_v = opt.get("ask", 0.0)
+                oi_v = opt.get("open_interest", 0)
+                vol_v = opt.get("volume", 0)
+                live_metrics_extra = (
+                    f'<div><span class="lbl">BID / ASK (LIVE)</span><span class="mono val">{b_v:.2f} $ / {a_v:.2f} $</span></div>'
+                    f'<div><span class="lbl">OI / VOL / Δ</span><span class="mono val">OI {oi_v} · Vol {vol_v} · Δ {opt["delta"]:.2f}</span></div>'
+                )
+            else:
+                live_metrics_extra = (
+                    f'<div><span class="lbl">DELTA</span><span class="mono val">Δ {opt["delta"]:.2f}</span></div>'
+                    f'<div><span class="lbl">IMPL. VOLA</span><span class="mono val">{opt.get("iv_pct", 0):.1f}%</span></div>'
+                )
+
+            prem_cls = "txt-emerald" if is_opt_qual else "txt-amber"
             opt_cell = (
                 f'<div class="cell-card {opt_cls}">'
-                f'<div class="card-top-row">'
+                f'<div class="card-top-row" style="gap:4px;flex-wrap:wrap">'
                 f'<span class="opt-badge {type_badge_cls}">{esc(opt["type"])}</span>'
+                f'{live_chain_badge}'
                 f'<span class="mono txt-muted">{esc(opt.get("cycle_label", ""))}</span>'
                 f'</div>'
-                f'<div class="mono opt-contract">{esc(opt.get("contract", ""))}</div>'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:6px">'
+                f'<div class="mono opt-contract" style="margin-bottom:0">{esc(opt.get("contract", ""))}</div>'
+                f'<button type="button" class="chart-jump-btn mono track-pos-btn" data-tracksym="{esc(sym)}" onclick="quickTrackPosition(\'{esc(sym)}\')">＋ Überwachen</button>'
+                f'</div>'
                 f'<div class="opt-metrics-grid">'
                 f'<div><span class="lbl">STRIKE</span><span class="mono val">{_format_strike_str(opt["strike"])} $ ({sign}{opt["otm_pct"]:.1f}%)</span></div>'
-                f'<div><span class="lbl">PRÄMIE</span><span class="mono val txt-emerald">+{opt["prem_pct"]:.2f}% ({opt["premium_usd"]:.2f} $)</span></div>'
-                f'<div><span class="lbl">DELTA</span><span class="mono val">Δ {opt["delta"]:.2f}</span></div>'
-                f'<div><span class="lbl">IMPL. VOLA</span><span class="mono val">{opt.get("iv_pct", 0):.1f}%</span></div>'
+                f'<div><span class="lbl">PRÄMIE (MID)</span><span class="mono val {prem_cls}">+{opt["prem_pct"]:.2f}% ({opt["premium_usd"]:.2f} $)</span></div>'
+                f'{live_metrics_extra}'
                 f'</div>'
                 f'{shield_html}{earn_warn_html}'
                 f'</div>'
             )
         elif opt:
+            no_wk_badge = ""
+            if opt.get("live_chain") and opt.get("has_weekly") is False:
+                no_wk_badge = '<span class="mono" style="font-size:9.5px;background:rgba(245,158,11,0.15);color:#fbbf24;padding:1.5px 5px;border-radius:3px;font-weight:700;margin-left:5px">NUR MONATS-OPT.</span>'
             opt_cell = (
                 f'<div class="cell-card opt-card-muted">'
-                f'<div class="mono txt-muted" style="font-size:11px;margin-bottom:3px">{esc(opt.get("type", ""))} · KEIN TRADE</div>'
+                f'<div class="mono txt-muted" style="font-size:11px;margin-bottom:4px">{esc(opt.get("type", ""))} · KEIN WEEKLY TRADE{no_wk_badge}</div>'
                 f'<div class="txt-muted" style="font-size:11.5px">{esc(opt.get("note", ""))}</div>'
                 f'</div>'
             )
@@ -2786,19 +3126,37 @@ def export_html_dashboard(results: list, html_path: str):
         ew = r.get("elliott_wave") or {}
         ind = r.get("indicators") or {}
         opt_compact = None
-        if opt and opt.get("strike"):
+        if opt and (opt.get("strike") or opt.get("has_weekly") is False):
+            sh_line = opt.get("sr_shield_line") or {}
             opt_compact = {
                 "q": bool(opt.get("qualified")),
                 "sh": bool(opt.get("sr_protected")),
+                "sh_p": sh_line.get("price"),
                 "t": opt.get("type", ""),
                 "k": opt.get("strike"),
                 "d": opt.get("delta"),
                 "pr": opt.get("prem_pct") or 0.0,
-                "p": opt.get("prem_usd") or opt.get("premium") or 0.0,
+                "p": opt.get("premium_usd") or opt.get("prem_usd") or opt.get("premium") or 0.0,
                 "otm": opt.get("otm_pct") or 0.0,
+                "iv": opt.get("iv_pct") or 30.0,
                 "con": opt.get("contract", ""),
+                "cyc": opt.get("cycle_label", ""),
+                "exp": opt.get("exp_iso", ""),
+                "dte": opt.get("dte", 4),
+                "lc": bool(opt.get("live_chain")),
+                "hw": opt.get("has_weekly", True),
+                "bid": opt.get("bid", 0.0),
+                "ask": opt.get("ask", 0.0),
+                "mid": opt.get("mid", 0.0),
+                "sp": opt.get("spread", 0.0),
+                "oi": opt.get("open_interest", 0),
+                "vol": opt.get("volume", 0),
+                "liq": opt.get("liq_label", ""),
                 "note": opt.get("note", ""),
             }
+        def _state_dir(st_str: str | None) -> int:
+            return 1 if st_str == "bullish" else (-1 if st_str == "bearish" else 0)
+
         chart_data_map[sym] = {
             "n": fund.get("name", sym),
             "cat": r.get("category", ""),
@@ -2814,10 +3172,12 @@ def export_html_dashboard(results: list, html_path: str):
             "res": [{"p": s["price"], "b": s["bounces"], "v": s["pivots"], "d": s["dist_pct"], "h": s.get("horizon", "major")} for s in (sr.get("resistances") or [])[:7]],
             "opt": opt_compact,
             "ind": {
-                "bb": (ind.get("BB") or {}).get("dir", 0),
-                "rsi": (ind.get("RSI") or {}).get("dir", 0),
-                "macd": (ind.get("MACD") or {}).get("dir", 0),
-                "stoch": (ind.get("STOCH") or {}).get("dir", 0),
+                "bb": _state_dir((ind.get("bollinger") or {}).get("state")),
+                "rsi": _state_dir((ind.get("rsi") or {}).get("state")),
+                "macd": _state_dir((ind.get("macd") or {}).get("state")),
+                "stoch": _state_dir((ind.get("stoch") or {}).get("state")),
+                "rsi_v": (ind.get("rsi") or {}).get("value"),
+                "stoch_k": ((ind.get("stoch") or {}).get("values") or {}).get("short_k"),
             },
             "rsn": r.get("reasons") or [],
             "ew": {
@@ -3556,6 +3916,7 @@ def export_html_dashboard(results: list, html_path: str):
       <div class="view-nav">
         <button class="view-btn active" id="nav-scanner" onclick="switchMainView('scanner', this)">Live-Scanner ({len(valid)})</button>
         <button class="view-btn" id="nav-charts" onclick="switchMainView('charts', this)">📊 UMWA Charts (1J)</button>
+        <button class="view-btn" id="nav-positions" onclick="switchMainView('positions', this)">🛡️ Positionen (<span id="navPosCount">0</span>)</button>
         <button class="view-btn" id="nav-fundamentals" onclick="switchMainView('fundamentals', this)">Kauf-Niveau ({len(top_fundamentals)})</button>
       </div>
       <button id="refreshBtn" class="action-btn" onclick="triggerLiveRefresh()">↻ Live-Update</button>
@@ -3745,6 +4106,43 @@ def export_html_dashboard(results: list, html_path: str):
         </aside>
       </div>
     </div>
+
+    <div id="view-positions" style="display:none">
+      <section class="controls-bar" style="margin-bottom:16px">
+        <form onsubmit="return addManualPosition(event)" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;width:100%">
+          <span style="font-size:12.5px;font-weight:800;color:var(--txt-primary);margin-right:4px">🛡️ Position hinzufügen:</span>
+          <input id="posSymInput" type="text" list="posSymDatalist" class="input-box mono" style="min-width:115px;width:125px;text-transform:uppercase" placeholder="Ticker (APP)" oninput="autoFillPositionDefaults()" required>
+          <datalist id="posSymDatalist">
+            {"".join(f'<option value="{esc(s)}">{esc((chart_data_map.get(s) or {}).get("n", s))}</option>' for s in chart_order)}
+          </datalist>
+          <select id="posTypeInput" class="select-box mono" onchange="autoFillPositionDefaults()">
+            <option value="SHORT PUT">SHORT PUT</option>
+            <option value="SHORT CALL">SHORT CALL</option>
+          </select>
+          <input id="posStrikeInput" type="number" step="0.01" class="input-box mono" style="min-width:110px;width:120px" placeholder="Strike ($)" required>
+          <input id="posExpInput" type="date" class="input-box mono" style="min-width:140px;width:148px" required>
+          <input id="posPremInput" type="number" step="0.01" class="input-box mono" style="min-width:125px;width:135px" placeholder="Einstiegs-Prämie ($)" required>
+          <input id="posSrInput" type="number" step="0.01" class="input-box mono" style="min-width:135px;width:145px" placeholder="🔵 S/R-Linie ($)">
+          <button type="submit" class="action-btn" style="background:linear-gradient(135deg, rgba(16,185,129,0.22), rgba(56,189,248,0.22));border-color:rgba(16,185,129,0.5);color:#f8fafc">＋ Überwachen</button>
+        </form>
+      </section>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Ticker / Kontrakt &amp; Verfall</th>
+              <th>Live-Kurs vs. Strike</th>
+              <th>🔵 S/R-Schutzmauer Status</th>
+              <th>Options-Wert &amp; Prämien-Abbau</th>
+              <th>4 UMWA-Indikatoren Check</th>
+              <th>Risiko-Wächter &amp; Aktion</th>
+            </tr>
+          </thead>
+          <tbody id="positionsTbody"></tbody>
+        </table>
+      </div>
+    </div>
   </main>
 
   <!-- iPad / Handy & Bruder-App Modal -->
@@ -3928,6 +4326,8 @@ function switchMainView(view, btn) {{
   document.getElementById('view-scanner').style.display = (view === 'scanner') ? '' : 'none';
   document.getElementById('view-charts').style.display = (view === 'charts') ? '' : 'none';
   document.getElementById('view-fundamentals').style.display = (view === 'fundamentals') ? '' : 'none';
+  const posView = document.getElementById('view-positions');
+  if (posView) posView.style.display = (view === 'positions') ? '' : 'none';
   document.querySelectorAll('.view-btn').forEach(b => b.classList.remove('active'));
   if (btn) btn.classList.add('active');
   else {{
@@ -3937,8 +4337,396 @@ function switchMainView(view, btn) {{
   if (view === 'charts') {{
     renderWatchlistSidebar();
     selectChartSymbol(activeChartSym);
+  }} else if (view === 'positions') {{
+    renderOpenPositions();
   }}
   window.scrollTo({{ top: 0, behavior: 'smooth' }});
+}}
+
+// =====================================================================
+// VORSCHLAG 1: OFFENE POSITIONEN & RISIKO-WÄCHTER (CLEAN)
+// =====================================================================
+const MVP_POS_STORAGE_KEY = 'mvp_v1_open_positions_2026';
+let openPositions = [];
+
+function loadOpenPositions() {{
+  try {{
+    const raw = localStorage.getItem(MVP_POS_STORAGE_KEY);
+    if (raw) {{
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) openPositions = parsed;
+    }}
+  }} catch (e) {{}}
+  updateTrackButtonsAndCount();
+  syncPositionsFromServer();
+}}
+
+function saveOpenPositions(pushServer = true) {{
+  try {{
+    localStorage.setItem(MVP_POS_STORAGE_KEY, JSON.stringify(openPositions));
+  }} catch (e) {{}}
+  updateTrackButtonsAndCount();
+  if (pushServer) pushPositionsToServer();
+}}
+
+async function syncPositionsFromServer() {{
+  try {{
+    const base = await resolveApiBase();
+    const r = await fetch(base + '/api/positions?_t=' + Date.now(), {{ cache: 'no-store' }});
+    if (r.ok) {{
+      const d = await r.json();
+      if (d && Array.isArray(d.positions)) {{
+        if (d.positions.length > 0 || openPositions.length === 0) {{
+          openPositions = d.positions;
+          try {{ localStorage.setItem(MVP_POS_STORAGE_KEY, JSON.stringify(openPositions)); }} catch (e) {{}}
+          updateTrackButtonsAndCount();
+          const posView = document.getElementById('view-positions');
+          if (posView && posView.style.display !== 'none') renderOpenPositions();
+        }} else if (openPositions.length > 0 && d.positions.length === 0) {{
+          pushPositionsToServer();
+        }}
+      }}
+    }}
+  }} catch (e) {{}}
+}}
+
+async function pushPositionsToServer() {{
+  try {{
+    const base = await resolveApiBase();
+    await fetch(base + '/api/positions', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ positions: openPositions }}),
+    }});
+  }} catch (e) {{}}
+}}
+
+function updateTrackButtonsAndCount() {{
+  const cntEl = document.getElementById('navPosCount');
+  if (cntEl) cntEl.textContent = String(openPositions.length);
+  const trackedSyms = new Set(openPositions.map(p => p.sym));
+  document.querySelectorAll('.track-pos-btn').forEach(btn => {{
+    const s = btn.getAttribute('data-tracksym');
+    if (trackedSyms.has(s)) {{
+      btn.textContent = '✓ Überwacht';
+      btn.style.background = 'rgba(16, 185, 129, 0.22)';
+      btn.style.color = '#34d399';
+      btn.style.borderColor = 'rgba(16, 185, 129, 0.5)';
+    }} else {{
+      btn.textContent = '＋ Überwachen';
+      btn.style.background = '';
+      btn.style.color = '';
+      btn.style.borderColor = '';
+    }}
+  }});
+}}
+
+function defaultFridayExpiryIso() {{
+  const lastDateStr = MASTER_DATES[MASTER_DATES.length - 1];
+  const base = lastDateStr ? new Date(lastDateStr + 'T12:00:00') : new Date();
+  const wd = base.getDay(); // 0=So..6=Sa
+  let add = (5 - wd + 7) % 7;
+  if (add < 2) add += 7;
+  base.setDate(base.getDate() + add);
+  return base.toISOString().slice(0, 10);
+}}
+
+function autoFillPositionDefaults() {{
+  const symEl = document.getElementById('posSymInput');
+  const typeEl = document.getElementById('posTypeInput');
+  const kEl = document.getElementById('posStrikeInput');
+  const expEl = document.getElementById('posExpInput');
+  const premEl = document.getElementById('posPremInput');
+  const srEl = document.getElementById('posSrInput');
+  if (!symEl) return;
+  const sym = (symEl.value || '').trim().toUpperCase();
+  const d = CHART_DATA[sym];
+  if (expEl && !expEl.value) expEl.value = defaultFridayExpiryIso();
+  if (!d) return;
+
+  if (d.opt && d.opt.k) {{
+    if (typeEl && d.opt.t) typeEl.value = d.opt.t;
+    if (kEl && !kEl.value) kEl.value = d.opt.k;
+    if (premEl && !premEl.value && d.opt.p) premEl.value = d.opt.p;
+    if (expEl && d.opt.exp) expEl.value = d.opt.exp;
+  }}
+  const isPut = (typeEl ? typeEl.value : 'SHORT PUT').includes('PUT');
+  if (srEl) {{
+    if (d.opt && d.opt.sh_p) srEl.value = d.opt.sh_p;
+    else if (isPut && d.sup && d.sup.length) srEl.value = d.sup[0].p;
+    else if (!isPut && d.res && d.res.length) srEl.value = d.res[0].p;
+  }}
+}}
+
+function quickTrackPosition(sym) {{
+  const d = CHART_DATA[sym];
+  if (!d || !d.opt || !d.opt.k) return;
+  const existingIdx = openPositions.findIndex(p => p.sym === sym && Math.abs(p.strike - d.opt.k) < 0.01);
+  if (existingIdx >= 0) {{
+    switchMainView('positions', document.getElementById('nav-positions'));
+    return;
+  }}
+  const isPut = (d.opt.t || '').includes('PUT');
+  let srLine = d.opt.sh_p || null;
+  if (!srLine) {{
+    if (isPut && d.sup && d.sup.length) srLine = d.sup[0].p;
+    else if (!isPut && d.res && d.res.length) srLine = d.res[0].p;
+  }}
+  const pos = {{
+    id: sym + '_' + Date.now(),
+    sym: sym,
+    type: d.opt.t || (isPut ? 'SHORT PUT' : 'SHORT CALL'),
+    contract: d.opt.con || (sym + ' ' + d.opt.k + (isPut ? ' P' : ' C')),
+    strike: Number(d.opt.k),
+    expiry: d.opt.exp || defaultFridayExpiryIso(),
+    entryPrem: Number(d.opt.p || 0.50),
+    entryPrice: Number(d.last),
+    srLine: srLine ? Number(srLine) : null,
+    addedAt: new Date().toISOString().slice(0, 10),
+  }};
+  openPositions.unshift(pos);
+  saveOpenPositions(true);
+  if (activeChartSym === sym) selectChartSymbol(sym);
+}}
+
+function addManualPosition(e) {{
+  if (e && e.preventDefault) e.preventDefault();
+  const sym = (document.getElementById('posSymInput').value || '').trim().toUpperCase();
+  const type = document.getElementById('posTypeInput').value || 'SHORT PUT';
+  const strike = parseFloat(document.getElementById('posStrikeInput').value || '0');
+  const expiry = document.getElementById('posExpInput').value || defaultFridayExpiryIso();
+  const entryPrem = parseFloat(document.getElementById('posPremInput').value || '0');
+  const srRaw = parseFloat(document.getElementById('posSrInput').value || '0');
+  if (!sym || strike <= 0 || entryPrem <= 0) return false;
+
+  const d = CHART_DATA[sym];
+  const isPut = type.includes('PUT');
+  let srLine = srRaw > 0 ? srRaw : null;
+  if (!srLine && d) {{
+    if (isPut && d.sup && d.sup.length) {{
+      const prot = d.sup.find(s => s.p >= strike && s.p <= d.last) || d.sup[0];
+      if (prot) srLine = prot.p;
+    }} else if (!isPut && d.res && d.res.length) {{
+      const prot = d.res.find(r => r.p <= strike && r.p >= d.last) || d.res[0];
+      if (prot) srLine = prot.p;
+    }}
+  }}
+
+  const pos = {{
+    id: sym + '_' + Date.now(),
+    sym: sym,
+    type: type,
+    contract: sym + ' ' + expiry.slice(5) + ' ' + strike + (isPut ? ' P' : ' C'),
+    strike: strike,
+    expiry: expiry,
+    entryPrem: entryPrem,
+    entryPrice: d ? d.last : strike,
+    srLine: srLine,
+    addedAt: new Date().toISOString().slice(0, 10),
+  }};
+  openPositions.unshift(pos);
+  saveOpenPositions(true);
+  document.getElementById('posSymInput').value = '';
+  document.getElementById('posStrikeInput').value = '';
+  document.getElementById('posPremInput').value = '';
+  document.getElementById('posSrInput').value = '';
+  renderOpenPositions();
+  return false;
+}}
+
+function removeTrackedPosition(posId) {{
+  openPositions = openPositions.filter(p => p.id !== posId);
+  saveOpenPositions(true);
+  renderOpenPositions();
+  if (document.getElementById('view-charts').style.display !== 'none') drawUmwaChart();
+}}
+
+function normCdfJs(x) {{
+  const t = 1.0 / (1.0 + 0.2316419 * Math.abs(x));
+  const d = 0.3989423 * Math.exp(-x * x / 2.0);
+  const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+  return x > 0 ? 1.0 - p : p;
+}}
+
+function estimateCurrentOptionValue(pos, d) {{
+  if (!d) return pos.entryPrem;
+  const S = d.last;
+  const K = pos.strike;
+  const isPut = (pos.type || '').includes('PUT');
+  // Wenn exakt dieser Strike im aktuellen Live-Scan ist, nutze direkt den echten Live-Mid/Ask-Wert!
+  if (d.opt && d.opt.k && Math.abs(d.opt.k - K) < 0.01 && ((isPut && (d.opt.t || '').includes('PUT')) || (!isPut && (d.opt.t || '').includes('CALL')))) {{
+    if (d.opt.mid > 0) return d.opt.mid;
+    if (d.opt.p > 0) return d.opt.p;
+  }}
+  const lastDateStr = MASTER_DATES[MASTER_DATES.length - 1] || new Date().toISOString().slice(0, 10);
+  const nowDt = new Date(lastDateStr + 'T16:00:00');
+  const expDt = new Date((pos.expiry || defaultFridayExpiryIso()) + 'T21:00:00');
+  const diffDays = Math.max(0.15, (expDt - nowDt) / (1000 * 3600 * 24));
+  const tradingDte = Math.max(0.2, diffDays * (5.0 / 7.0));
+  const T = tradingDte / 252.0;
+  const sigma = Math.max(0.16, ((d.opt && d.opt.iv) ? d.opt.iv : 32.0) / 100.0);
+  const r = 0.045;
+  const sqrtT = Math.sqrt(T);
+  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrtT);
+  const d2 = d1 - sigma * sqrtT;
+  if (isPut) {{
+    return Math.max(0.01, K * Math.exp(-r * T) * normCdfJs(-d2) - S * normCdfJs(-d1));
+  }} else {{
+    return Math.max(0.01, S * normCdfJs(d1) - K * Math.exp(-r * T) * normCdfJs(d2));
+  }}
+}}
+
+function renderOpenPositions() {{
+  const tbody = document.getElementById('positionsTbody');
+  if (!tbody) return;
+  const expEl = document.getElementById('posExpInput');
+  if (expEl && !expEl.value) expEl.value = defaultFridayExpiryIso();
+
+  if (!openPositions.length) {{
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:34px 20px;color:var(--txt-muted);font-size:13px">' +
+      'Noch keine offenen Positionen in der Überwachung. Klicke im <b>Live-Scanner</b> oder in den <b>UMWA Charts</b> bei einer Option auf <b>„＋ Überwachen“</b> oder trage oben einen Kontrakt ein.' +
+      '</td></tr>';
+    return;
+  }}
+
+  const lastDateStr = MASTER_DATES[MASTER_DATES.length - 1] || new Date().toISOString().slice(0, 10);
+  const nowDt = new Date(lastDateStr + 'T12:00:00');
+
+  const rows = openPositions.map(pos => {{
+    const d = CHART_DATA[pos.sym];
+    const S = d ? d.last : pos.entryPrice;
+    const K = Number(pos.strike);
+    const isPut = (pos.type || '').includes('PUT');
+    const typeCls = isPut ? 'opt-badge-put' : 'opt-badge-call';
+
+    // 1. OTM-Abstand zum Strike
+    const otmPct = isPut ? ((S - K) / S) * 100.0 : ((K - S) / S) * 100.0;
+    const isItm = otmPct <= 0.0;
+    const isNearStrike = otmPct > 0.0 && otmPct < 1.6;
+    const otmClr = isItm ? 'var(--rose)' : (isNearStrike ? 'var(--amber)' : 'var(--emerald)');
+
+    // 2. Restlaufzeit (DTE)
+    const expDt = new Date((pos.expiry || defaultFridayExpiryIso()) + 'T21:00:00');
+    const dteCal = Math.max(0, Math.ceil((expDt - nowDt) / (1000 * 3600 * 24)));
+
+    // 3. S/R-Schutzmauer Status
+    let srPrice = pos.srLine ? Number(pos.srLine) : null;
+    if (!srPrice && d) {{
+      if (isPut && d.sup && d.sup.length) {{
+        const found = d.sup.find(x => x.p >= K && x.p <= S) || d.sup[0];
+        if (found) srPrice = found.p;
+      }} else if (!isPut && d.res && d.res.length) {{
+        const found = d.res.find(x => x.p <= K && x.p >= S) || d.res[0];
+        if (found) srPrice = found.p;
+      }}
+    }}
+    let srHtml = '<span class="txt-muted">Keine S/R-Linie zwischen Kurs &amp; Strike</span>';
+    let srBroken = false;
+    if (srPrice) {{
+      if (isPut) {{
+        srBroken = (S < srPrice * 0.997);
+        const distSr = ((S - srPrice) / S) * 100.0;
+        if (!srBroken && srPrice >= K) {{
+          srHtml = '<div class="sr-row sr-active-sup" style="margin:0"><span class="sr-tag sup-tag">🔵 SUP</span><span class="mono sr-price">' + srPrice.toFixed(2) + ' $</span><span class="mono" style="color:var(--emerald);font-weight:700">🛡️ Hält (+' + distSr.toFixed(1) + '% Puffer)</span></div>';
+        }} else if (srBroken) {{
+          srHtml = '<div class="sr-row" style="margin:0;border-color:var(--rose);background:var(--rose-bg)"><span class="sr-tag" style="background:var(--rose);color:#fff">⚠️ BRUCH</span><span class="mono sr-price">' + srPrice.toFixed(2) + ' $</span><span class="mono" style="color:var(--rose);font-weight:700">Support unterschritten (' + distSr.toFixed(1) + '%)</span></div>';
+        }} else {{
+          srHtml = '<div class="sr-row" style="margin:0"><span class="sr-tag sup-tag">🔵 SUP</span><span class="mono sr-price">' + srPrice.toFixed(2) + ' $</span><span class="mono txt-muted">(' + distSr.toFixed(1) + '%)</span></div>';
+        }}
+      }} else {{
+        srBroken = (S > srPrice * 1.003);
+        const distSr = ((srPrice - S) / S) * 100.0;
+        if (!srBroken && srPrice <= K) {{
+          srHtml = '<div class="sr-row sr-active-res" style="margin:0"><span class="sr-tag res-tag">🔵 RES</span><span class="mono sr-price">' + srPrice.toFixed(2) + ' $</span><span class="mono" style="color:var(--emerald);font-weight:700">🛡️ Hält (+' + distSr.toFixed(1) + '% Puffer)</span></div>';
+        }} else if (srBroken) {{
+          srHtml = '<div class="sr-row" style="margin:0;border-color:var(--rose);background:var(--rose-bg)"><span class="sr-tag" style="background:var(--rose);color:#fff">⚠️ BRUCH</span><span class="mono sr-price">' + srPrice.toFixed(2) + ' $</span><span class="mono" style="color:var(--rose);font-weight:700">Widerstand überboten (' + (-distSr).toFixed(1) + '%)</span></div>';
+        }} else {{
+          srHtml = '<div class="sr-row" style="margin:0"><span class="sr-tag res-tag">🔵 RES</span><span class="mono sr-price">' + srPrice.toFixed(2) + ' $</span><span class="mono txt-muted">(+' + distSr.toFixed(1) + '%)</span></div>';
+        }}
+      }}
+    }}
+
+    // 4. Aktueller Optionswert & Prämien-Abbau
+    const curOptVal = estimateCurrentOptionValue(pos, d);
+    const entryP = Math.max(0.01, Number(pos.entryPrem));
+    const decayPct = Math.max(-200, Math.min(99, Math.round(((entryP - curOptVal) / entryP) * 100)));
+    const barPct = Math.max(4, Math.min(100, decayPct));
+    const decayClr = decayPct >= 70 ? 'var(--emerald)' : (decayPct >= 0 ? 'var(--sky)' : 'var(--rose)');
+
+    // 5. 4 UMWA-Indikatoren Check
+    let indHtml = '<span class="txt-muted">—</span>';
+    let indAgainst = false;
+    if (d && d.ind) {{
+      const mkChip = (lbl, v) => {{
+        const c = v > 0 ? 'chip-bull' : (v < 0 ? 'chip-bear' : 'chip-neutral');
+        const ic = v > 0 ? '▲' : (v < 0 ? '▼' : '·');
+        return '<span class="ind-chip ' + c + '">' + ic + ' ' + lbl + '</span>';
+      }};
+      indHtml = '<div class="ind-strip" style="margin-bottom:4px">' +
+        mkChip('BB', d.ind.bb) + mkChip('RSI', d.ind.rsi) + mkChip('MACD', d.ind.macd) + mkChip('STOCH', d.ind.stoch) +
+        '</div>';
+      if (isPut && d.bear >= 3) {{
+        indAgainst = true;
+        indHtml += '<div style="font-size:11px;color:var(--rose);font-weight:700">⚠️ Gegen-Signal: ' + d.bear + '/4 Bearish</div>';
+      }} else if (!isPut && d.bull >= 3) {{
+        indAgainst = true;
+        indHtml += '<div style="font-size:11px;color:var(--rose);font-weight:700">⚠️ Gegen-Signal: ' + d.bull + '/4 Bullish</div>';
+      }} else {{
+        indHtml += '<div style="font-size:11px;color:var(--txt-muted)">Trend stabil (' + d.bull + 'B / ' + d.bear + 'S)</div>';
+      }}
+    }}
+
+    // 6. Wächter-Gesamtstatus
+    let guardBadge = '';
+    let guardSub = '';
+    if (isItm) {{
+      guardBadge = '<span class="sig-badge sig-strong-sell">🚨 ALARM · IM STRIKE (ITM)</span>';
+      guardSub = 'Kurs hat Strike erreicht -> Rollen / Glattstellen prüfen!';
+    }} else if (srBroken || isNearStrike || indAgainst) {{
+      guardBadge = '<span class="sig-badge sig-weak-buy">⚠️ WARNUNG · SCHUTZ PRÜFEN</span>';
+      guardSub = srBroken ? 'Blaue Schutzlinie verletzt' : (isNearStrike ? 'Nur noch ' + otmPct.toFixed(1) + '% bis zum Strike' : 'Indikatoren drehen gegen Position');
+    }} else if (decayPct >= 70) {{
+      guardBadge = '<span class="sig-badge sig-strong-buy">🎯 TAKE PROFIT (' + decayPct + '% VERDIENT)</span>';
+      guardSub = 'Über 70% der Prämie abgebaut -> Gewinn sichern möglich';
+    }} else {{
+      guardBadge = '<span class="sig-badge" style="background:rgba(56,189,248,0.14);color:var(--sky);border:1px solid rgba(56,189,248,0.35)">🛡️ SICHER · AUF KURS</span>';
+      guardSub = 'Abstand & Schutzmauer intakt';
+    }}
+
+    return '<tr>' +
+      '<td>' +
+        '<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap">' +
+          '<b class="mono sym-badge">' + pos.sym + '</b>' +
+          '<button type="button" class="chart-jump-btn mono" onclick="openStockChart(\\'' + pos.sym + '\\')">📊 Chart</button>' +
+          '<span class="opt-badge ' + typeCls + '">' + pos.type + '</span>' +
+        '</div>' +
+        '<div class="mono" style="font-size:12.5px;font-weight:800;color:var(--txt-primary);margin-top:5px">' + (pos.contract || '') + '</div>' +
+        '<div class="mono date-sub">Verfall: ' + (pos.expiry || '') + ' (noch ' + dteCal + 'T)</div>' +
+      '</td>' +
+      '<td>' +
+        '<div class="mono price-main">Kurs: ' + S.toFixed(2) + ' $</div>' +
+        '<div class="mono" style="font-size:13px;font-weight:800;color:var(--txt-secondary);margin-top:3px">Strike: ' + K.toFixed(2) + ' $</div>' +
+        '<div class="mono" style="font-size:12px;font-weight:800;color:' + otmClr + ';margin-top:3px">' +
+          (isItm ? ('ITM (' + otmPct.toFixed(2) + '%)') : ('+' + otmPct.toFixed(2) + '% OTM Puffer')) +
+        '</div>' +
+      '</td>' +
+      '<td>' + srHtml + '</td>' +
+      '<td>' +
+        '<div class="mono" style="font-size:12.5px;color:var(--txt-secondary)">Einstieg: <b style="color:var(--txt-primary)">' + entryP.toFixed(2) + ' $</b> &rarr; Aktuell: <b style="color:' + decayClr + '">' + curOptVal.toFixed(2) + ' $</b></div>' +
+        '<div class="range-bar" style="height:6px;margin:7px 0 4px 0;max-width:190px"><div style="height:100%;width:' + barPct + '%;background:' + decayClr + '"></div></div>' +
+        '<div class="mono" style="font-size:12px;font-weight:800;color:' + decayClr + '">' + (decayPct >= 0 ? ('+' + decayPct + '% Prämie abgebaut') : (decayPct + '% im Minus')) + '</div>' +
+      '</td>' +
+      '<td>' + indHtml + '</td>' +
+      '<td>' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px">' +
+          '<div>' + guardBadge + '<div class="sig-sub">' + guardSub + '</div></div>' +
+          '<button type="button" class="action-btn mono" style="padding:5px 10px;font-size:11px;border-color:rgba(244,63,94,0.4);color:var(--rose)" onclick="removeTrackedPosition(\\'' + pos.id + '\\')">✕ Schließen</button>' +
+        '</div>' +
+      '</td>' +
+    '</tr>';
+  }});
+
+  tbody.innerHTML = rows.join('');
 }}
 
 function openStockChart(sym) {{
@@ -4492,9 +5280,9 @@ function selectChartSymbol(sym) {{
   // Bottom Cards aktualisieren
   const ind = d.ind || {{}};
   const pill = (lbl, v) => {{
-    const cls = v > 0 ? 'ind-bull' : (v < 0 ? 'ind-bear' : 'ind-neut');
+    const cls = v > 0 ? 'chip-bull' : (v < 0 ? 'chip-bear' : 'chip-neutral');
     const ic = v > 0 ? '▲' : (v < 0 ? '▼' : '·');
-    return '<span class="mono ind-pill ' + cls + '" style="margin-right:4px">' + lbl + ' ' + ic + '</span>';
+    return '<span class="mono ind-chip ' + cls + '" style="margin-right:4px">' + ic + ' ' + lbl + '</span>';
   }};
   const rsnHtml = (d.rsn && d.rsn.length)
     ? d.rsn.map(x => '<div style="font-size:11.5px;color:var(--txt-secondary);margin-top:3px">• ' + x + '</div>').join('')
@@ -4503,19 +5291,33 @@ function selectChartSymbol(sym) {{
     pill('BB', ind.bb) + pill('RSI', ind.rsi) + pill('MACD', ind.macd) + pill('STOCH', ind.stoch) + '</div>' + rsnHtml;
 
   const supHtml = (d.sup || []).map(s =>
-    '<div class="mono" style="font-size:12px;color:#60a5fa;margin-bottom:3px">🔵 <b>SUP ' + s.p.toFixed(2) + ' $</b> (' + (s.d >= 0 ? '+' : '') + s.d.toFixed(1) + '% · ' + s.b + 'x Touch / ' + s.v + ' Pivots)</div>'
+    '<div class="mono" style="font-size:12px;color:#60a5fa;margin-bottom:3px">🔵 <b>SUP ' + s.p.toFixed(2) + ' $</b> (' + (s.d >= 0 ? '+' : '') + s.d.toFixed(1) + '% · ' + (s.h === 'short' && s.v <= 1 ? 'Kurzfr. Low' : (s.b + 'x Touch / ' + s.v + ' Pivots')) + ')</div>'
   ).join('');
   const resHtml = (d.res || []).map(r =>
-    '<div class="mono" style="font-size:12px;color:#38bdf8;margin-bottom:3px">🔵 <b>RES ' + r.p.toFixed(2) + ' $</b> (+' + r.d.toFixed(1) + '% · ' + r.b + 'x Touch / ' + r.v + ' Pivots)</div>'
+    '<div class="mono" style="font-size:12px;color:#38bdf8;margin-bottom:3px">🔵 <b>RES ' + r.p.toFixed(2) + ' $</b> (+' + r.d.toFixed(1) + '% · ' + (r.h === 'short' && r.v <= 1 ? 'Kurzfr. Top' : (r.b + 'x Touch / ' + r.v + ' Pivots')) + ')</div>'
   ).join('');
   document.getElementById('tvCardSR').innerHTML = (supHtml || resHtml) ? (supHtml + resHtml) : '<div class="txt-muted">Keine validierte horizontale Linie im nahen Radius.</div>';
 
-  if (d.opt && d.opt.q) {{
+  if (d.opt && d.opt.k) {{
     const shBadge = d.opt.sh ? '<div style="color:var(--emerald);font-weight:700;font-size:11.5px;margin-top:4px">🛡️ GESCHÜTZT durch S/R-Linie</div>' : '';
+    let liveRow = '';
+    if (d.opt.lc) {{
+      const tagTxt = d.opt.hw === false ? '🗓️ Monats-Opt. Bid/Ask:' : (d.opt.q ? '🟢 Live Bid/Ask:' : '🟡 Live Bid/Ask (<0,7%):');
+      const tagClr = d.opt.q ? '#38bdf8' : '#fbbf24';
+      liveRow = '<div class="mono" style="font-size:11.5px;color:' + tagClr + ';margin-top:3px">' + tagTxt + ' <b>' + (d.opt.bid || 0).toFixed(2) + ' $ / ' + (d.opt.ask || 0).toFixed(2) + ' $</b> · OI ' + (d.opt.oi || 0) + ' · Vol ' + (d.opt.vol || 0) + '</div>';
+    }}
+    const isTracked = openPositions.some(p => p.sym === sym);
+    const trackBtnLbl = isTracked ? '✓ Überwacht' : '＋ Überwachen';
+    const premClr = d.opt.q ? 'var(--emerald)' : 'var(--amber)';
     document.getElementById('tvCardOpt').innerHTML =
-      '<div class="mono" style="font-size:13px;font-weight:800;color:var(--txt-primary)">' + (d.opt.con || d.opt.t) + '</div>' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px">' +
+        '<div class="mono" style="font-size:13px;font-weight:800;color:var(--txt-primary)">' + (d.opt.con || d.opt.t) + '</div>' +
+        '<button type="button" class="chart-jump-btn mono track-pos-btn" data-tracksym="' + sym + '" onclick="quickTrackPosition(\\'' + sym + '\\')">' + trackBtnLbl + '</button>' +
+      '</div>' +
       '<div class="mono" style="font-size:12px;color:var(--txt-secondary);margin-top:3px">Strike: <b style="color:var(--txt-primary)">' + (d.opt.k || 0).toFixed(2) + ' $</b> (OTM ' + (d.opt.otm || 0).toFixed(1) + '%) · Δ ' + (d.opt.d || 0).toFixed(2) + '</div>' +
-      '<div class="mono" style="font-size:12.5px;color:var(--emerald);font-weight:800;margin-top:2px">Prämie: +' + (d.opt.p || 0).toFixed(2) + ' $ (+' + (d.opt.pr || 0).toFixed(2) + '%)</div>' + shBadge;
+      '<div class="mono" style="font-size:12.5px;color:' + premClr + ';font-weight:800;margin-top:2px">Prämie (Mid): +' + (d.opt.p || 0).toFixed(2) + ' $ (+' + (d.opt.pr || 0).toFixed(2) + '%)</div>' +
+      liveRow + shBadge;
+    updateTrackButtonsAndCount();
   }} else if (d.opt) {{
     document.getElementById('tvCardOpt').innerHTML = '<div class="txt-muted" style="font-size:11.5px">' + (d.opt.note || 'Kein qualifizierter Weekly-Strike') + '</div>';
   }} else {{
@@ -4866,7 +5668,7 @@ function drawUmwaChart() {{
     }});
   }}
 
-  // 1d. Weekly Stillhalter Options-Strike-Linie (🛡️)
+  // 1d. Weekly Stillhalter Options-Strike-Linie (🛡️) & Aktive überwachte Positionen (📌)
   if (chartLayers.opt && c.meta.opt && c.meta.opt.k) {{
     const opt = c.meta.opt;
     const y = yOfP1(opt.k);
@@ -4878,7 +5680,8 @@ function drawUmwaChart() {{
       ctx.lineWidth = 1.7;
       ctx.setLineDash([6, 4]);
       ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
-      const lbl = (opt.sh ? '🛡️ ' : '') + opt.t + ' STRIKE ' + opt.k.toFixed(2) + '$ (Δ ' + (opt.d || 0).toFixed(2) + ' · +' + (opt.pr || 0).toFixed(2) + '%)';
+      const liveTag = opt.lc ? ' · LIVE' : '';
+      const lbl = (opt.sh ? '🛡️ ' : '') + opt.t + ' STRIKE ' + opt.k.toFixed(2) + '$ (Δ ' + (opt.d || 0).toFixed(2) + ' · +' + (opt.pr || 0).toFixed(2) + '%' + liveTag + ')';
       ctx.font = 'bold 10.5px "SF Mono", Menlo, monospace';
       const tw = ctx.measureText(lbl).width + 10;
       ctx.fillStyle = 'rgba(6, 78, 59, 0.90)';
@@ -4887,6 +5690,28 @@ function drawUmwaChart() {{
       ctx.fillText(lbl, plotW - tw - 7, y - 4.5);
       ctx.restore();
     }}
+  }}
+  if (typeof openPositions !== 'undefined' && Array.isArray(openPositions)) {{
+    openPositions.filter(p => p.sym === c.sym).forEach(pos => {{
+      const pk = Number(pos.strike || 0);
+      if (!pk) return;
+      const y = yOfP1(pk);
+      if (y >= p1Top + 4 && y <= p1Top + p1H - 4) {{
+        ctx.save();
+        ctx.strokeStyle = '#fbbf24';
+        ctx.lineWidth = 2.0;
+        ctx.setLineDash([8, 3]);
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
+        const lbl = '📌 ÜBERWACHT: ' + (pos.type || 'SHORT PUT') + ' STRIKE ' + pk.toFixed(2) + '$ (Verfall ' + (pos.expiry || pos.exp || '') + ')';
+        ctx.font = 'bold 10.5px "SF Mono", Menlo, monospace';
+        const tw = ctx.measureText(lbl).width + 12;
+        ctx.fillStyle = 'rgba(120, 53, 15, 0.92)';
+        ctx.fillRect(plotW - tw - 12, y + 2, tw, 15);
+        ctx.fillStyle = '#fde68a';
+        ctx.fillText(lbl, plotW - tw - 6, y + 13);
+        ctx.restore();
+      }}
+    }});
   }}
 
   // 1e. Candlesticks (Sichtbarer Ausschnitt)
@@ -5425,6 +6250,7 @@ function drawUmwaChart() {{
 }})();
 
 applyAllFilters();
+loadOpenPositions();
 (async function checkInitialRefresh() {{
   if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {{
     try {{
