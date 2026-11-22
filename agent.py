@@ -2065,9 +2065,39 @@ def evaluate_4_indicators(candles: list) -> dict:
     }
 
 
+_EVAL_MEM_CACHE: dict[str, tuple] = {}
+_EVAL_MEM_LOCK = threading.Lock()
+
+
 def _process_one(sym: str, period: str, live_quote: dict | None = None) -> dict:
     candles, source = fetch_candles(sym, period=period, live_quote=live_quote)
-    res = evaluate_4_indicators(candles)
+    sig_key = None
+    res = None
+    if candles:
+        lc = candles[-1]
+        sig_key = (
+            sym,
+            period,
+            len(candles),
+            lc.get("time"),
+            round(float(lc.get("open") or 0), 4),
+            round(float(lc.get("high") or 0), 4),
+            round(float(lc.get("low") or 0), 4),
+            round(float(lc.get("close") or 0), 4),
+        )
+        with _EVAL_MEM_LOCK:
+            cached_pair = _EVAL_MEM_CACHE.get(sym)
+            if cached_pair and cached_pair[0] == sig_key:
+                res = dict(cached_pair[1])
+                if res.get("option_setup"):
+                    res["option_setup"] = dict(res["option_setup"])
+
+    if res is None:
+        res = evaluate_4_indicators(candles)
+        if sig_key is not None:
+            with _EVAL_MEM_LOCK:
+                _EVAL_MEM_CACHE[sym] = (sig_key, dict(res))
+
     res["symbol"] = sym
     res["category"] = SYMBOL_CATEGORY.get(sym, "CUSTOM")
     res["source"] = source

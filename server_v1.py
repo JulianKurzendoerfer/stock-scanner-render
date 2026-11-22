@@ -42,12 +42,24 @@ LAST_CLOUD_SYNC_TS = 0
 REFRESH_START_TS = 0
 
 
+import agent
+
+def _warmup_in_memory_cache():
+    """Lädt beim Server-Start sofort den Kerzen-Cache in den RAM und wärmt die Indikator-Engine vor."""
+    try:
+        agent._load_candle_cache()
+        if agent._CANDLE_CACHE_MEM:
+            with agent.ThreadPoolExecutor(max_workers=8 if IS_RENDER_CLOUD else 24) as pool:
+                list(pool.map(lambda s: agent._process_one(s, "d", None), agent.DEFAULT_WATCHLIST))
+    except Exception:
+        pass
+
+
 def _sync_to_cloud_worker():
     """
     Hybrid-Turbo (Option 1):
-    Pusht das auf dem M1 Mac mini fertig berechnete Dashboard im Hintergrund:
-      1. Zu stock-scanner-render (Branch version-1 -> https://version-1-umwa.onrender.com)
-      2. Zu trading-landing-page (Branch main -> https://www.market-vision-pro.com / IONOS Domain)
+    Pusht das auf dem M1 Mac mini fertig berechnete Dashboard im Hintergrund
+    direkt zu trading-landing-page (Branch main -> https://www.market-vision-pro.com).
     """
     global LAST_CLOUD_SYNC_TS
     if IS_RENDER_CLOUD:
@@ -55,41 +67,6 @@ def _sync_to_cloud_worker():
     with CLOUD_SYNC_LOCK:
         ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         src_html = BASE_DIR / "Version_1_App.html"
-        # 1. Sync stock-scanner-render (version-1)
-        try:
-            git_dir = BASE_DIR / ".git"
-            if git_dir.exists():
-                subprocess.run(
-                    ["git", "add", "Version_1_App.html", "Stillhalter_Dashboard.html", "agent.py", "server_v1.py", ".candle_cache_d.json.gz"],
-                    cwd=str(BASE_DIR),
-                    capture_output=True,
-                    timeout=20,
-                )
-                diff_res = subprocess.run(
-                    ["git", "diff", "--cached", "--quiet"],
-                    cwd=str(BASE_DIR),
-                    capture_output=True,
-                    timeout=10,
-                )
-                if diff_res.returncode != 0:
-                    subprocess.run(
-                        ["git", "commit", "-m", f"Auto-Sync Mac mini M1 Scan ({ts_str})"],
-                        cwd=str(BASE_DIR),
-                        capture_output=True,
-                        timeout=20,
-                    )
-                push_res = subprocess.run(
-                    ["git", "push", "origin", "version-1"],
-                    cwd=str(BASE_DIR),
-                    capture_output=True,
-                    timeout=45,
-                )
-                if push_res.returncode == 0:
-                    LAST_CLOUD_SYNC_TS = int(time.time())
-        except Exception:
-            pass
-
-        # 2. Sync trading-landing-page (main -> www.market-vision-pro.com)
         try:
             landing_dir = BASE_DIR.parent / "trading-landing-page"
             if landing_dir.exists() and (landing_dir / ".git").exists() and src_html.exists():
@@ -110,17 +87,19 @@ def _sync_to_cloud_worker():
                 )
                 if diff_res2.returncode != 0:
                     subprocess.run(
-                        ["git", "commit", "-m", f"Deploy Version 1 Protected App to market-vision-pro.com ({ts_str})"],
+                        ["git", "commit", "-m", f"Auto-Sync Mac mini M1 Scan to market-vision-pro.com ({ts_str})"],
                         cwd=str(landing_dir),
                         capture_output=True,
                         timeout=20,
                     )
-                subprocess.run(
+                push_res = subprocess.run(
                     ["git", "push", "origin", "main"],
                     cwd=str(landing_dir),
                     capture_output=True,
                     timeout=45,
                 )
+                if push_res.returncode == 0:
+                    LAST_CLOUD_SYNC_TS = int(time.time())
         except Exception:
             pass
 
@@ -132,27 +111,20 @@ def _run_refresh_worker():
         t0 = time.time()
         REFRESH_START_TS = int(t0)
         try:
-            python_bin = BASE_DIR / "venv" / "bin" / "python"
-            if not python_bin.exists():
-                python_bin = Path(sys.executable)
-            res = subprocess.run(
-                [str(python_bin), str(BASE_DIR / "agent.py"), "--only-signals", "--html"],
-                cwd=str(BASE_DIR),
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-            desktop_html = Path.home() / "Desktop" / "Version_1_App.html"
+            out = agent.scan_symbols(agent.DEFAULT_WATCHLIST, period="d", only_signals=True)
             src_html = BASE_DIR / "Version_1_App.html"
+            dash_html = BASE_DIR / "Stillhalter_Dashboard.html"
+            agent.export_html_dashboard(out, str(dash_html))
+            desktop_html = Path.home() / "Desktop" / "Version_1_App.html"
             if src_html.exists() and desktop_html.parent.exists():
                 try:
                     desktop_html.write_bytes(src_html.read_bytes())
                 except Exception:
                     pass
-            LAST_REFRESH_OK = (res.returncode == 0)
+            LAST_REFRESH_OK = True
             LAST_REFRESH_TS = int(time.time())
             LAST_DURATION_SEC = round(time.time() - t0, 2)
-            if LAST_REFRESH_OK and not IS_RENDER_CLOUD:
+            if not IS_RENDER_CLOUD:
                 threading.Thread(target=_sync_to_cloud_worker, daemon=True).start()
         except Exception:
             LAST_REFRESH_OK = False
@@ -423,6 +395,7 @@ class ThreadedHTTPServer(http.server.ThreadingHTTPServer):
 
 
 def main():
+    threading.Thread(target=_warmup_in_memory_cache, daemon=True).start()
     if not IS_RENDER_CLOUD:
         threading.Thread(target=_market_scheduler_loop, daemon=True).start()
     lan_ip = get_lan_ip()
