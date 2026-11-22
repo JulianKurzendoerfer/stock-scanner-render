@@ -341,11 +341,13 @@ def fetch_candles_eodhd(symbol: str, api_key: str, period: str = "d", days: int 
     return candles
 
 
+import gzip
 import threading
 
 _CANDLE_CACHE_LOCK = threading.Lock()
 _CANDLE_CACHE_MEM: dict[str, list] = {}
 _CANDLE_CACHE_DIRTY = False
+_CANDLE_CACHE_FILE_GZ = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".candle_cache_d.json.gz")
 _CANDLE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".candle_cache_d.json")
 
 
@@ -354,13 +356,21 @@ def _load_candle_cache() -> None:
     if _CANDLE_CACHE_MEM or os.getenv("UMWA_FORCE_FRESH") == "1":
         return
     try:
-        if os.path.exists(_CANDLE_CACHE_FILE):
-            import time as _t
-            if (_t.time() - os.path.getmtime(_CANDLE_CACHE_FILE)) < 21600:  # 6h TTL
-                with open(_CANDLE_CACHE_FILE, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-                if payload.get("date") == date.today().isoformat() and isinstance(payload.get("data"), dict):
-                    _CANDLE_CACHE_MEM = payload["data"]
+        import time as _t
+        if os.path.exists(_CANDLE_CACHE_FILE_GZ) and (_t.time() - os.path.getmtime(_CANDLE_CACHE_FILE_GZ)) < 345600:
+            with gzip.open(_CANDLE_CACHE_FILE_GZ, "rt", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload.get("data"), dict) and len(payload["data"]) >= 50:
+                _CANDLE_CACHE_MEM = payload["data"]
+                return
+        if os.path.exists(_CANDLE_CACHE_FILE) and (_t.time() - os.path.getmtime(_CANDLE_CACHE_FILE)) < 345600:
+            with open(_CANDLE_CACHE_FILE, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload.get("data"), dict) and len(payload["data"]) >= 50:
+                _CANDLE_CACHE_MEM = payload["data"]
+                if not os.path.exists(_CANDLE_CACHE_FILE_GZ):
+                    with gzip.open(_CANDLE_CACHE_FILE_GZ, "wt", encoding="utf-8") as gz:
+                        json.dump(payload, gz, separators=(",", ":"))
     except Exception:
         pass
 
@@ -370,10 +380,10 @@ def _save_candle_cache() -> None:
     if not _CANDLE_CACHE_DIRTY or not _CANDLE_CACHE_MEM:
         return
     try:
-        tmp_path = _CANDLE_CACHE_FILE + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        tmp_path = _CANDLE_CACHE_FILE_GZ + ".tmp"
+        with gzip.open(tmp_path, "wt", encoding="utf-8") as f:
             json.dump({"date": date.today().isoformat(), "data": _CANDLE_CACHE_MEM}, f, separators=(",", ":"))
-        os.replace(tmp_path, _CANDLE_CACHE_FILE)
+        os.replace(tmp_path, _CANDLE_CACHE_FILE_GZ)
         _CANDLE_CACHE_DIRTY = False
     except Exception:
         pass
@@ -2099,7 +2109,8 @@ def scan_symbols(symbols: list, period: str = "d", only_signals: bool = False):
     results = []
     errors = []
 
-    with ThreadPoolExecutor(max_workers=24) as pool:
+    workers = 8 if os.environ.get("RENDER") else 24
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         future_map = {pool.submit(_process_one, sym, period, live_quotes.get(sym)): sym for sym in symbols}
         for fut in as_completed(future_map):
             sym = future_map[fut]
@@ -2293,7 +2304,9 @@ def export_html_dashboard(results: list, html_path: str):
     from datetime import datetime
     import html as html_mod
 
-    now_str = datetime.now().strftime("%d.%m.%Y · %H:%M:%S CET")
+    now_dt = datetime.now()
+    now_str = now_dt.strftime("%d.%m.%Y · %H:%M:%S CET")
+    build_ts = int(now_dt.timestamp())
     valid = [r for r in results if "error" not in r and r.get("signal_level") != "INACTIVE"]
     inactive_list = [r for r in results if r.get("signal_level") == "INACTIVE"]
 
@@ -3891,44 +3904,74 @@ function sortTable(key) {{
   rows.forEach(r => tbody.appendChild(r));
 }}
 
+const PAGE_BUILD_TS = {build_ts};
+
 async function resolveApiBase() {{
   if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {{
     try {{
-      const r = await fetch('/api/status');
+      const r = await fetch('/api/status?_t=' + Date.now(), {{ cache: 'no-store' }});
       if (r.ok && (r.headers.get('content-type') || '').includes('application/json')) {{
         return '';
       }}
     }} catch (e) {{}}
   }}
-  try {{
-    const r = await fetch('http://localhost:8765/api/status');
-    if (r.ok) return 'http://localhost:8765';
-  }} catch (e) {{}}
+  for (const cand of ['http://127.0.0.1:8765', 'http://localhost:8765']) {{
+    try {{
+      const ctrl = new AbortController();
+      const tid = setTimeout(() => ctrl.abort(), 900);
+      const r = await fetch(cand + '/api/status?_t=' + Date.now(), {{ signal: ctrl.signal, cache: 'no-store' }});
+      clearTimeout(tid);
+      if (r.ok) return cand;
+    }} catch (e) {{}}
+  }}
   return 'https://version-1-umwa.onrender.com';
 }}
 
+async function applyRemoteHtmlUpdate(base) {{
+  try {{
+    const url = (base || '') + '/Version_1_App.html?_t=' + Date.now();
+    const r = await fetch(url, {{ cache: 'no-store' }});
+    if (r.ok) {{
+      const html = await r.text();
+      if (html && html.includes('CHART_DATA')) {{
+        document.open();
+        document.write(html);
+        document.close();
+        return true;
+      }}
+    }}
+  }} catch (e) {{}}
+  return false;
+}}
+
 async function pollRefreshStatus(base, btn) {{
-  btn.disabled = true;
+  if (btn) btn.disabled = true;
   const start = Date.now();
   while (true) {{
     const sec = Math.max(1, Math.round((Date.now() - start) / 1000));
-    btn.innerHTML = '⏳ Scanne 255 Aktien (' + sec + 's)...';
-    await new Promise(r => setTimeout(r, 2000));
+    if (btn) btn.innerHTML = '⏳ Scanne 255 Aktien (' + sec + 's)...';
+    await new Promise(r => setTimeout(r, 1200));
     try {{
-      const st = await fetch(base + '/api/status');
+      const st = await fetch(base + '/api/status?_t=' + Date.now(), {{ cache: 'no-store' }});
       if (st.ok) {{
         const d = await st.json();
         if (!d.refreshing) {{
-          if (base === '' || window.location.hostname.includes('market-vision-pro.com')) window.location.reload();
-          else window.location.href = base + '/';
+          if (btn) btn.innerHTML = '✓ Lade neue Daten...';
+          const swapped = await applyRemoteHtmlUpdate(base);
+          if (!swapped) {{
+            if (base === '') window.location.replace(window.location.pathname + '?_t=' + Date.now());
+            else window.location.reload();
+          }}
           return;
         }}
       }}
     }} catch (e) {{}}
     if (sec > 180) break;
   }}
-  btn.innerHTML = '↻ Live-Update';
-  btn.disabled = false;
+  if (btn) {{
+    btn.innerHTML = '↻ Live-Update';
+    btn.disabled = false;
+  }}
 }}
 
 async function triggerLiveRefresh() {{
@@ -5227,11 +5270,15 @@ applyAllFilters();
 (async function checkInitialRefresh() {{
   if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {{
     try {{
-      const r = await fetch('/api/status');
+      const base = await resolveApiBase();
+      const r = await fetch(base + '/api/status?_t=' + Date.now(), {{ cache: 'no-store' }});
       if (r.ok) {{
         const d = await r.json();
         if (d.refreshing) {{
-          pollRefreshStatus('', document.getElementById('refreshBtn'));
+          pollRefreshStatus(base, document.getElementById('refreshBtn'));
+        }} else if (base !== '' && d.last_refresh_ts && d.last_refresh_ts > PAGE_BUILD_TS + 15 && !window.__mvpRemoteSynced) {{
+          window.__mvpRemoteSynced = true;
+          await applyRemoteHtmlUpdate(base);
         }}
       }}
     }} catch (e) {{}}

@@ -721,7 +721,7 @@
       </button>
       <div class="status-pill mono">
         <span class="live-dot"></span>
-        <span id="liveStatusText">22.11.2026 · 15:41:46 CET</span>
+        <span id="liveStatusText">22.11.2026 · 16:10:03 CET</span>
       </div>
     </div>
   </header>
@@ -1164,44 +1164,74 @@ function sortTable(key) {
   rows.forEach(r => tbody.appendChild(r));
 }
 
+const PAGE_BUILD_TS = 1795360203;
+
 async function resolveApiBase() {
   if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
     try {
-      const r = await fetch('/api/status');
+      const r = await fetch('/api/status?_t=' + Date.now(), { cache: 'no-store' });
       if (r.ok && (r.headers.get('content-type') || '').includes('application/json')) {
         return '';
       }
     } catch (e) {}
   }
-  try {
-    const r = await fetch('http://localhost:8765/api/status');
-    if (r.ok) return 'http://localhost:8765';
-  } catch (e) {}
+  for (const cand of ['http://127.0.0.1:8765', 'http://localhost:8765']) {
+    try {
+      const ctrl = new AbortController();
+      const tid = setTimeout(() => ctrl.abort(), 900);
+      const r = await fetch(cand + '/api/status?_t=' + Date.now(), { signal: ctrl.signal, cache: 'no-store' });
+      clearTimeout(tid);
+      if (r.ok) return cand;
+    } catch (e) {}
+  }
   return 'https://version-1-umwa.onrender.com';
 }
 
+async function applyRemoteHtmlUpdate(base) {
+  try {
+    const url = (base || '') + '/Version_1_App.html?_t=' + Date.now();
+    const r = await fetch(url, { cache: 'no-store' });
+    if (r.ok) {
+      const html = await r.text();
+      if (html && html.includes('CHART_DATA')) {
+        document.open();
+        document.write(html);
+        document.close();
+        return true;
+      }
+    }
+  } catch (e) {}
+  return false;
+}
+
 async function pollRefreshStatus(base, btn) {
-  btn.disabled = true;
+  if (btn) btn.disabled = true;
   const start = Date.now();
   while (true) {
     const sec = Math.max(1, Math.round((Date.now() - start) / 1000));
-    btn.innerHTML = '⏳ Scanne 255 Aktien (' + sec + 's)...';
-    await new Promise(r => setTimeout(r, 2000));
+    if (btn) btn.innerHTML = '⏳ Scanne 255 Aktien (' + sec + 's)...';
+    await new Promise(r => setTimeout(r, 1200));
     try {
-      const st = await fetch(base + '/api/status');
+      const st = await fetch(base + '/api/status?_t=' + Date.now(), { cache: 'no-store' });
       if (st.ok) {
         const d = await st.json();
         if (!d.refreshing) {
-          if (base === '' || window.location.hostname.includes('market-vision-pro.com')) window.location.reload();
-          else window.location.href = base + '/';
+          if (btn) btn.innerHTML = '✓ Lade neue Daten...';
+          const swapped = await applyRemoteHtmlUpdate(base);
+          if (!swapped) {
+            if (base === '') window.location.replace(window.location.pathname + '?_t=' + Date.now());
+            else window.location.reload();
+          }
           return;
         }
       }
     } catch (e) {}
     if (sec > 180) break;
   }
-  btn.innerHTML = '↻ Live-Update';
-  btn.disabled = false;
+  if (btn) {
+    btn.innerHTML = '↻ Live-Update';
+    btn.disabled = false;
+  }
 }
 
 async function triggerLiveRefresh() {
@@ -2500,11 +2530,15 @@ applyAllFilters();
 (async function checkInitialRefresh() {
   if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
     try {
-      const r = await fetch('/api/status');
+      const base = await resolveApiBase();
+      const r = await fetch(base + '/api/status?_t=' + Date.now(), { cache: 'no-store' });
       if (r.ok) {
         const d = await r.json();
         if (d.refreshing) {
-          pollRefreshStatus('', document.getElementById('refreshBtn'));
+          pollRefreshStatus(base, document.getElementById('refreshBtn'));
+        } else if (base !== '' && d.last_refresh_ts && d.last_refresh_ts > PAGE_BUILD_TS + 15 && !window.__mvpRemoteSynced) {
+          window.__mvpRemoteSynced = true;
+          await applyRemoteHtmlUpdate(base);
         }
       }
     } catch (e) {}

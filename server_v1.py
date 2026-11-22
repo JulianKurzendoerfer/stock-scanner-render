@@ -60,7 +60,7 @@ def _sync_to_cloud_worker():
             git_dir = BASE_DIR / ".git"
             if git_dir.exists():
                 subprocess.run(
-                    ["git", "add", "Version_1_App.html", "Stillhalter_Dashboard.html", "agent.py", "server_v1.py"],
+                    ["git", "add", "Version_1_App.html", "Stillhalter_Dashboard.html", "agent.py", "server_v1.py", ".candle_cache_d.json.gz"],
                     cwd=str(BASE_DIR),
                     capture_output=True,
                     timeout=20,
