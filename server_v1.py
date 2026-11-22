@@ -45,37 +45,39 @@ REFRESH_START_TS = 0
 def _sync_to_cloud_worker():
     """
     Hybrid-Turbo (Option 1):
-    Pusht das auf dem M1 Mac mini fertig berechnete Dashboard im Hintergrund
-    zu GitHub (Branch version-1) -> Render aktualisiert sich automatisch weltweit.
+    Pusht das auf dem M1 Mac mini fertig berechnete Dashboard im Hintergrund:
+      1. Zu stock-scanner-render (Branch version-1 -> https://version-1-umwa.onrender.com)
+      2. Zu trading-landing-page (Branch main -> https://www.market-vision-pro.com / IONOS Domain)
     """
     global LAST_CLOUD_SYNC_TS
     if IS_RENDER_CLOUD:
         return
     with CLOUD_SYNC_LOCK:
+        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        src_html = BASE_DIR / "Version_1_App.html"
+        # 1. Sync stock-scanner-render (version-1)
         try:
             git_dir = BASE_DIR / ".git"
-            if not git_dir.exists():
-                return
-            subprocess.run(
-                ["git", "add", "Version_1_App.html", "Stillhalter_Dashboard.html"],
-                cwd=str(BASE_DIR),
-                capture_output=True,
-                timeout=20,
-            )
-            diff_res = subprocess.run(
-                ["git", "diff", "--cached", "--quiet"],
-                cwd=str(BASE_DIR),
-                capture_output=True,
-                timeout=10,
-            )
-            if diff_res.returncode != 0:
-                ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if git_dir.exists():
                 subprocess.run(
-                    ["git", "commit", "-m", f"Auto-Sync Mac mini M1 Scan ({ts_str})"],
+                    ["git", "add", "Version_1_App.html", "Stillhalter_Dashboard.html", "agent.py", "server_v1.py"],
                     cwd=str(BASE_DIR),
                     capture_output=True,
                     timeout=20,
                 )
+                diff_res = subprocess.run(
+                    ["git", "diff", "--cached", "--quiet"],
+                    cwd=str(BASE_DIR),
+                    capture_output=True,
+                    timeout=10,
+                )
+                if diff_res.returncode != 0:
+                    subprocess.run(
+                        ["git", "commit", "-m", f"Auto-Sync Mac mini M1 Scan ({ts_str})"],
+                        cwd=str(BASE_DIR),
+                        capture_output=True,
+                        timeout=20,
+                    )
                 push_res = subprocess.run(
                     ["git", "push", "origin", "version-1"],
                     cwd=str(BASE_DIR),
@@ -84,6 +86,41 @@ def _sync_to_cloud_worker():
                 )
                 if push_res.returncode == 0:
                     LAST_CLOUD_SYNC_TS = int(time.time())
+        except Exception:
+            pass
+
+        # 2. Sync trading-landing-page (main -> www.market-vision-pro.com)
+        try:
+            landing_dir = BASE_DIR.parent / "trading-landing-page"
+            if landing_dir.exists() and (landing_dir / ".git").exists() and src_html.exists():
+                html_bytes = src_html.read_bytes()
+                (landing_dir / "index.html").write_bytes(html_bytes)
+                (landing_dir / "Version_1_App.html").write_bytes(html_bytes)
+                subprocess.run(
+                    ["git", "add", "index.html", "Version_1_App.html", "manifest.json", "apple-touch-icon.png", "icon-512.png"],
+                    cwd=str(landing_dir),
+                    capture_output=True,
+                    timeout=20,
+                )
+                diff_res2 = subprocess.run(
+                    ["git", "diff", "--cached", "--quiet"],
+                    cwd=str(landing_dir),
+                    capture_output=True,
+                    timeout=10,
+                )
+                if diff_res2.returncode != 0:
+                    subprocess.run(
+                        ["git", "commit", "-m", f"Deploy Version 1 Protected App to market-vision-pro.com ({ts_str})"],
+                        cwd=str(landing_dir),
+                        capture_output=True,
+                        timeout=20,
+                    )
+                subprocess.run(
+                    ["git", "push", "origin", "main"],
+                    cwd=str(landing_dir),
+                    capture_output=True,
+                    timeout=45,
+                )
         except Exception:
             pass
 

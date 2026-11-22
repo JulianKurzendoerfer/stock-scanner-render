@@ -3305,15 +3305,132 @@ def export_html_dashboard(results: list, html_path: str):
     background: rgba(56, 189, 248, 0.14);
     border-left: 3px solid var(--sky);
   }}
+  /* Full-Screen Login Gate */
+  .auth-gate {{
+    position: fixed;
+    inset: 0;
+    z-index: 99999;
+    background: radial-gradient(circle at 50% 18%, #131d31 0%, #070a10 72%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }}
+  .auth-card {{
+    background: rgba(13, 18, 28, 0.96);
+    border: 1px solid var(--border-strong);
+    border-radius: 16px;
+    width: 100%;
+    max-width: 420px;
+    padding: 32px 28px;
+    box-shadow: 0 28px 70px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(56, 189, 248, 0.12);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+  }}
+  .auth-field {{
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 16px;
+  }}
+  .auth-label {{
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--txt-secondary);
+  }}
+  .auth-input {{
+    background: #121926;
+    color: var(--txt-primary);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    padding: 11px 14px;
+    font-size: 14px;
+    font-weight: 600;
+    outline: none;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    width: 100%;
+  }}
+  .auth-input:focus {{
+    border-color: var(--sky);
+    box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.15);
+  }}
+  .auth-btn {{
+    width: 100%;
+    background: linear-gradient(135deg, #10b981, #0ea5e9);
+    color: #04130d;
+    border: none;
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 13.5px;
+    font-weight: 800;
+    letter-spacing: 0.2px;
+    cursor: pointer;
+    transition: transform 0.1s ease, filter 0.15s ease;
+    margin-top: 6px;
+  }}
+  .auth-btn:hover {{ filter: brightness(1.08); }}
+  .auth-btn:active {{ transform: scale(0.99); }}
+  .auth-err {{
+    display: none;
+    background: var(--rose-bg);
+    border: 1px solid var(--rose-border);
+    color: var(--rose);
+    border-radius: 7px;
+    padding: 9px 12px;
+    font-size: 12px;
+    font-weight: 700;
+    margin-bottom: 14px;
+    text-align: center;
+  }}
+  @keyframes authShake {{
+    0%, 100% {{ transform: translateX(0); }}
+    20%, 60% {{ transform: translateX(-7px); }}
+    40%, 80% {{ transform: translateX(7px); }}
+  }}
+  .auth-shake {{ animation: authShake 0.35s ease; }}
 </style>
 </head>
 <body>
+  <!-- Geschütztes Mitglieder-Login-Gate -->
+  <div id="mvpAuthGate" class="auth-gate">
+    <form id="mvpAuthForm" class="auth-card" onsubmit="return handleMvpLogin(event)">
+      <div style="display:flex;flex-direction:column;align-items:center;text-align:center;margin-bottom:24px">
+        {brand_icon_html}
+        <h1 style="font-size:19px;font-weight:800;letter-spacing:-0.3px;margin:14px 0 4px 0;color:var(--txt-primary)">
+          MARKET VISION PRO <span class="v1-badge">VERSION 1</span>
+        </h1>
+        <div style="font-size:12px;color:var(--txt-muted);font-weight:600">Geschützter Mitglieder-Zugang</div>
+      </div>
+
+      <div id="mvpAuthError" class="auth-err">Ungültiger Benutzername oder Zugangs-Code.</div>
+
+      <div class="auth-field">
+        <label class="auth-label" for="mvpUserInput">Benutzername</label>
+        <input id="mvpUserInput" type="text" class="auth-input" placeholder="Benutzername eingeben..." autocomplete="username" autocapitalize="words" spellcheck="false" required>
+      </div>
+
+      <div class="auth-field">
+        <label class="auth-label" for="mvpCodeInput">Zugangs-Code</label>
+        <input id="mvpCodeInput" type="password" inputmode="numeric" class="auth-input mono" placeholder="•••••" autocomplete="current-password" required>
+      </div>
+
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--txt-secondary);margin-bottom:14px;cursor:pointer;user-select:none">
+        <input id="mvpRememberChk" type="checkbox" checked style="accent-color:var(--emerald);width:15px;height:15px;cursor:pointer">
+        Auf diesem Gerät angemeldet bleiben
+      </label>
+
+      <button type="submit" class="auth-btn">Anmelden &amp; Terminal öffnen &rarr;</button>
+    </form>
+  </div>
+
+  <div id="mvpProtectedApp" style="display:none">
   <header class="topbar">
     <div class="brand-wrap">
       {brand_icon_html}
       <div>
         <h1 class="brand-title">MARKET VISION PRO <span class="v1-badge">VERSION 1</span></h1>
-        <div class="brand-sub">4 UMWA-Indikatoren · 1J TradingView-Charts · Validierte S/R-Linien · OCC/IBKR Options-Strikes · Elliott-Wave &amp; Fundamental{esc(inactive_note)}</div>
       </div>
     </div>
     <div class="top-actions">
@@ -3323,7 +3440,12 @@ def export_html_dashboard(results: list, html_path: str):
         <button class="view-btn" id="nav-fundamentals" onclick="switchMainView('fundamentals', this)">Kauf-Niveau ({len(top_fundamentals)})</button>
       </div>
       <button id="refreshBtn" class="action-btn" onclick="triggerLiveRefresh()">↻ Live-Update</button>
-      <button class="action-btn action-btn-gold" onclick="openShareModal()">📲 iPad / Handy &amp; Bruder-App</button>
+      <button class="action-btn action-btn-gold" onclick="openShareModal()">📲 App &amp; Teilen</button>
+      <button type="button" class="action-btn" onclick="logoutMvpUser()" title="Abmelden">
+        <span id="mvpActiveUserLbl">👤 Mitglied</span>
+        <span style="color:var(--txt-muted)">·</span>
+        <span style="color:var(--rose);font-size:11px">Logout</span>
+      </button>
       <div class="status-pill mono">
         <span class="live-dot"></span>
         <span id="liveStatusText">{esc(now_str)}</span>
@@ -3337,27 +3459,22 @@ def export_html_dashboard(results: list, html_path: str):
       <div class="kpi-card">
         <span class="kpi-lbl">S/R-Geschützte Top-Setups</span>
         <span class="kpi-val mono txt-emerald">{len(shielded_main)}</span>
-        <span class="kpi-sub">3–4/4 Signal + Standard-Strike hinter S/R-Linie</span>
       </div>
       <div class="kpi-card">
         <span class="kpi-lbl">Qualifizierte Weekly Optionen</span>
         <span class="kpi-val mono txt-sky">{len(qualified_main)}</span>
-        <span class="kpi-sub">Erfüllen Δ &le; 0,30 · OTM &ge; 2,0% · Prämie &ge; 0,70%</span>
       </div>
       <div class="kpi-card">
         <span class="kpi-lbl">Hauptsignale Long (Short Put)</span>
         <span class="kpi-val mono txt-emerald">{len(strong_buys)}</span>
-        <span class="kpi-sub">Mindestens 3 von 4 UMWA-Indikatoren bullish</span>
       </div>
       <div class="kpi-card">
         <span class="kpi-lbl">Hauptsignale Short (Short Call)</span>
         <span class="kpi-val mono txt-rose">{len(strong_sells)}</span>
-        <span class="kpi-sub">Mindestens 3 von 4 UMWA-Indikatoren bearish</span>
       </div>
       <div class="kpi-card">
-        <span class="kpi-lbl">Fundamental Top- / Attraktiv-Niveau</span>
+        <span class="kpi-lbl">Fundamental Top- / Attraktiv</span>
         <span class="kpi-val mono" style="color:var(--txt-primary)">{len(top_fundamentals)}</span>
-        <span class="kpi-sub">Profitable Qualitätswerte (Fwd-KGV, PEG &amp; 52W-Rabatt)</span>
       </div>
     </section>
 
@@ -3404,10 +3521,7 @@ def export_html_dashboard(results: list, html_path: str):
     <div id="view-fundamentals" style="display:none">
     <div id="fundamental-matrix" class="section-hdr" style="margin-top:8px">
       <div>
-        <h2>FUNDAMENTAL &amp; VALUATION MATRIX — Attraktive Kauf-Niveaus anhand der Unternehmenszahlen</h2>
-        <div class="brand-sub" style="margin-top:4px;display:block">
-          Unabhängig vom technischen Tages-Signal: Filtert alle profitablen Unternehmen aus deiner Watchlist, die nach Forward-KGV, konsistentem FY1→FY2 Gewinnwachstum, PEG-Ratio und 52-Wochen-Rabatt auf einem attraktiven Bewertungsniveau notieren.
-        </div>
+        <h2>FUNDAMENTAL &amp; VALUATION MATRIX</h2>
       </div>
     </div>
 
@@ -3560,7 +3674,7 @@ def export_html_dashboard(results: list, html_path: str):
       <div class="step-card" style="margin-bottom:0">
         <div style="font-weight:700;color:var(--txt-primary);margin-bottom:6px"><span class="step-num">SO GEHT'S</span>Auf iPad &amp; iPhone mit schönem Icon auf den Home-Bildschirm setzen</div>
         <ol style="margin:6px 0 0 18px;padding:0;font-size:12px;color:var(--txt-secondary);line-height:1.6">
-          <li>Öffne den Link (oder die geteilte Datei) auf dem iPad oder iPhone in <b>Safari</b>.</li>
+          <li>Öffne <b>https://www.market-vision-pro.com</b> auf dem iPad oder iPhone in <b>Safari</b>.</li>
           <li>Tippe auf das <b>Teilen-Symbol</b> (<span class="mono">↑</span> Viereck mit Pfeil nach oben).</li>
           <li>Wähle <b>„Zum Home-Bildschirm“</b> (Add to Home Screen) &rarr; Tippe auf <b>„Hinzufügen“</b>.</li>
           <li>Fertig! <b>Version 1</b> liegt jetzt mit dem neuen dunkel-goldenen <b>V1 App-Icon</b> als echte Vollbild-App auf deinem iPad, Handy und beim Bruder!</li>
@@ -3568,8 +3682,110 @@ def export_html_dashboard(results: list, html_path: str):
       </div>
     </div>
   </div>
+  </div><!-- /#mvpProtectedApp -->
 
 <script>
+// =====================================================================
+// MITGLIEDER-AUTHENTIFIZIERUNG (Julian, Pascal, Hannes, Laura, Steffan)
+// =====================================================================
+const MVP_AUTH_KEY = 'mvp_v1_auth_session_2026';
+const MVP_AUTH_HASHES = {{
+  '67825683201452b1': 'Julian',
+  '9741db88ef85b044': 'Pascal',
+  '80a0c335bc8f0aab': 'Hannes',
+  'd6c4648d934c79db': 'Laura',
+  'ad39aac7e47855d5': 'Steffan',
+  '0bad7959cc9ee473': 'Steffan'
+}};
+
+function computeMvpAuthHash(userStr, codeStr) {{
+  const s = 'MVP_V1_SALT_2026::' + String(userStr || '').trim().toLowerCase() + '::' + String(codeStr || '').trim() + '::UMWA';
+  let h1 = 0x811c9dc5 | 0;
+  let h2 = 0x01000193 | 0;
+  for (let i = 0; i < s.length; i++) {{
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul((h2 + c) | 0, 0x85ebca6b);
+  }}
+  const p1 = (h1 >>> 0).toString(16).padStart(8, '0');
+  const p2 = (h2 >>> 0).toString(16).padStart(8, '0');
+  return p1 + p2;
+}}
+
+function unlockMvpApp(displayName, tokenHash) {{
+  const gate = document.getElementById('mvpAuthGate');
+  const app = document.getElementById('mvpProtectedApp');
+  const lbl = document.getElementById('mvpActiveUserLbl');
+  if (gate) gate.style.display = 'none';
+  if (app) app.style.display = 'block';
+  if (lbl) lbl.textContent = '👤 ' + displayName;
+  if (document.getElementById('view-charts') && document.getElementById('view-charts').style.display !== 'none') {{
+    drawUmwaChart();
+  }}
+}}
+
+function handleMvpLogin(e) {{
+  if (e && e.preventDefault) e.preventDefault();
+  const uEl = document.getElementById('mvpUserInput');
+  const cEl = document.getElementById('mvpCodeInput');
+  const rEl = document.getElementById('mvpRememberChk');
+  const errEl = document.getElementById('mvpAuthError');
+  const formEl = document.getElementById('mvpAuthForm');
+  const uVal = uEl ? uEl.value : '';
+  const cVal = cEl ? cEl.value : '';
+  const h = computeMvpAuthHash(uVal, cVal);
+  const matchedUser = MVP_AUTH_HASHES[h];
+
+  if (matchedUser) {{
+    if (errEl) errEl.style.display = 'none';
+    const payload = JSON.stringify({{ h: h, u: matchedUser, ts: Date.now() }});
+    try {{
+      sessionStorage.setItem(MVP_AUTH_KEY, payload);
+      if (!rEl || rEl.checked) localStorage.setItem(MVP_AUTH_KEY, payload);
+      else localStorage.removeItem(MVP_AUTH_KEY);
+    }} catch (err) {{}}
+    unlockMvpApp(matchedUser, h);
+  }} else {{
+    if (errEl) errEl.style.display = 'block';
+    if (formEl) {{
+      formEl.classList.remove('auth-shake');
+      void formEl.offsetWidth;
+      formEl.classList.add('auth-shake');
+    }}
+    if (cEl) {{
+      cEl.value = '';
+      cEl.focus();
+    }}
+  }}
+  return false;
+}}
+
+function logoutMvpUser() {{
+  try {{
+    localStorage.removeItem(MVP_AUTH_KEY);
+    sessionStorage.removeItem(MVP_AUTH_KEY);
+  }} catch (err) {{}}
+  const gate = document.getElementById('mvpAuthGate');
+  const app = document.getElementById('mvpProtectedApp');
+  const cEl = document.getElementById('mvpCodeInput');
+  if (app) app.style.display = 'none';
+  if (gate) gate.style.display = 'flex';
+  if (cEl) cEl.value = '';
+}}
+
+(function checkSavedMvpAuth() {{
+  try {{
+    const raw = sessionStorage.getItem(MVP_AUTH_KEY) || localStorage.getItem(MVP_AUTH_KEY);
+    if (raw) {{
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.h && MVP_AUTH_HASHES[parsed.h]) {{
+        unlockMvpApp(MVP_AUTH_HASHES[parsed.h], parsed.h);
+        return;
+      }}
+    }}
+  }} catch (err) {{}}
+}})();
+
 const MASTER_DATES = {master_dates_json};
 const CHART_ORDER = {chart_order_json};
 const CHART_DATA = {chart_data_json};
@@ -3677,7 +3893,12 @@ function sortTable(key) {{
 
 async function resolveApiBase() {{
   if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {{
-    return '';
+    try {{
+      const r = await fetch('/api/status');
+      if (r.ok && (r.headers.get('content-type') || '').includes('application/json')) {{
+        return '';
+      }}
+    }} catch (e) {{}}
   }}
   try {{
     const r = await fetch('http://localhost:8765/api/status');
@@ -3698,7 +3919,7 @@ async function pollRefreshStatus(base, btn) {{
       if (st.ok) {{
         const d = await st.json();
         if (!d.refreshing) {{
-          if (base === '') window.location.reload();
+          if (base === '' || window.location.hostname.includes('market-vision-pro.com')) window.location.reload();
           else window.location.href = base + '/';
           return;
         }}
@@ -3722,27 +3943,18 @@ async function triggerLiveRefresh() {{
       return;
     }}
   }} catch (e) {{}}
-  window.location.href = 'https://version-1-umwa.onrender.com';
+  window.location.reload();
 }}
 
 async function openShareModal() {{
   document.getElementById('shareModal').classList.add('open');
   const box = document.getElementById('serverUrlBox');
   const qrWrap = document.getElementById('qrWrap');
-  const renderUrl = 'https://version-1-umwa.onrender.com';
-  box.innerHTML = '🌐 <b>24/7 Render Cloud-App aktiv!</b> Überall auf iPad &amp; Handy nutzbar (auch wenn dein Mac aus ist):';
-  document.getElementById('shareLinkInput').value = renderUrl;
-  document.getElementById('qrImg').src = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(renderUrl);
+  const mainDomainUrl = 'https://www.market-vision-pro.com';
+  box.innerHTML = '🌐 <b>Offizielle Website aktiv!</b> Überall auf Mac, iPad &amp; Handy mit Passwort-Schutz nutzbar:';
+  document.getElementById('shareLinkInput').value = mainDomainUrl;
+  document.getElementById('qrImg').src = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(mainDomainUrl);
   qrWrap.style.display = 'flex';
-  try {{
-    const r = await fetch('/api/status');
-    if (r.ok) {{
-      const d = await r.json();
-      const url = d.public_url || renderUrl;
-      document.getElementById('shareLinkInput').value = url;
-      document.getElementById('qrImg').src = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(url);
-    }}
-  }} catch (e) {{}}
 }}
 
 function closeShareModal() {{
@@ -4538,15 +4750,6 @@ function drawUmwaChart() {{
   drawLegVal(c.ema50[idx], '#f43f5e');
   drawLegVal(c.ema100[idx], '#3b82f6');
   drawLegVal(c.ema200[idx], '#d946ef');
-
-  // Dezenter Bedien-Hinweis oben rechts in Pane 1
-  const zoomHint = 'Mausrad/Pinch: Zoom · Ziehen: Verschieben · Preisachse ziehen: Y-Skala · Doppelklick: Auto';
-  ctx.font = '10px -apple-system, BlinkMacSystemFont, sans-serif';
-  const zhw = ctx.measureText(zoomHint).width;
-  if (plotW - zhw - 16 > lx + 20) {{
-    ctx.fillStyle = 'rgba(148, 163, 184, 0.55)';
-    ctx.fillText(zoomHint, plotW - zhw - 12, p1Top + 16);
-  }}
 
   // ===================================================================
   // PANE 2: STOCHASTIK UMWA (DUAL: KURZ 14,5,3 & LANG 50,6,5)
