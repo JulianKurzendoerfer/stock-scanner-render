@@ -53,16 +53,16 @@ WATCHLIST_GROUPS = {
         "ASML", "BKNG"
     ],
     "JULIAN-ACTIVE": [
-        "UBER", "RIVN", "PLTR", "ABNB", "DKNG", "RPD", "ENPH", "TENB", "ON", "WBD",
+        "UBER", "RIVN", "PLTR", "ABNB", "DKNG", "RPD", "ENPH", "TENB", "ON",
         "QCOM", "STM", "SPIR", "AFRM", "SHLS", "SERV", "RR", "ROKU", "NET", "ZS",
         "MYRG", "COIN", "CRWD"
     ],
     "JULIAN-VOLATILE": [
         "UPST", "CVNA", "SYM", "OPEN", "LCID", "TEAM", "FUBO", "ASTS", "BIOX", "EVGO",
-        "FLNC", "DRS", "ALOT", "MSTR", "GRMN"
+        "FLNC", "DRS", "MSTR", "GRMN"
     ],
     "JULIAN-TECH-BIO": [
-        "IREN", "OKLO", "SMR", "NBIS", "APLD", "MARA", "RIOT", "HUT", "BITF", "DNA",
+        "IREN", "OKLO", "SMR", "NBIS", "APLD", "MARA", "RIOT", "HUT", "DNA",
         "BNGO", "WOLF", "RKLB", "CALX", "ABAT", "AQMS", "NIO", "UMC", "AI", "DOCN",
         "SOUN", "BBAI", "SNOW", "AEHR", "IONQ", "RGTI", "QBTS", "BWXT", "CRSP", "MRNA",
         "NTLA", "BNTX", "BEAM", "EDIT", "VRTX", "ALNY", "RXRX", "PATH", "TER", "BKSY"
@@ -73,6 +73,22 @@ WATCHLIST_GROUPS = {
         "SPOT", "PINS", "SNAP", "TWLO", "MDB", "DDOG", "HUBS", "WDAY", "TTWO", "RBLX",
         "CELH", "DECK", "LULU", "ULTA", "CMG", "WING", "CAVA", "CROX", "WSM", "URI",
         "CAT", "DE", "GEV", "VST", "CEG", "FSLR", "VRT", "ETN", "LLY", "ISRG"
+    ],
+    "OPTIONS-TECH-GROWTH": [
+        "FTNT", "CHKP", "GTLB", "IOT", "ESTC", "MNDY", "DUOL", "TOST", "NU", "BABA",
+        "JD", "PDD", "BIDU", "FUTU", "VEEV", "CRDO", "ALAB", "MPWR", "STX", "WDC",
+        "NTAP", "SMTC", "ZBRA", "KEYS", "ACN", "HIMS", "OSCR", "ELF", "ONON", "BIRK",
+        "JOBY", "ACHR", "LUNR", "KTOS", "AXON", "EXPE", "EBAY", "ETSY", "TMUS", "VZ"
+    ],
+    "OPTIONS-VALUE-ENERGY": [
+        "CCJ", "UEC", "NEM", "ET", "OXY", "DVN", "SLB", "EOG", "FANG", "COP",
+        "CVX", "MPC", "VLO", "PSX", "CLF", "NUE", "STLD", "MOS", "CF", "HON",
+        "UNP", "UPS", "FDX", "LMT", "NOC", "GD", "LHX", "SCHW", "IBKR", "MS",
+        "C", "AXP", "COF", "BX", "KKR", "APO", "ICE", "CME", "USB", "PNC",
+        "TFC", "ALLY", "CB", "PGR", "MET", "PRU", "AIG", "WMT", "COST", "LOW",
+        "DAL", "UAL", "AAL", "CCL", "RCL", "NCLH", "MAR", "HLT", "CZR", "CVS",
+        "CI", "ELV", "HUM", "BMY", "MRK", "ABBV", "DXCM", "PODD", "BIIB", "GM",
+        "F", "VRSK", "MCO"
     ],
 }
 
@@ -93,77 +109,432 @@ DEFAULT_EODHD_KEY = "690cc04fad1308.55079017"
 # 1. LIVE-DATENQUELLEN (EODHD + Yahoo Real-Time Fusion & Fundamentaldaten)
 # =====================================================================
 
+import gzip
+import threading
+
+_YAHOO_LOCK = threading.Lock()
 _YAHOO_SESS = None
 _YAHOO_CRUMB = ""
 _YAHOO_TS = 0
 
+_FUND_CACHE_LOCK = threading.Lock()
+_FUND_CACHE_MEM: dict[str, dict] = {}
+_FUND_CACHE_FILE_GZ = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".fundamentals_cache.json.gz")
 
-def _get_yahoo_session_and_crumb() -> tuple[requests.Session, str]:
+_PROFILE_CACHE_LOCK = threading.Lock()
+_PROFILE_CACHE_MEM: dict[str, dict] = {}
+_PROFILE_CACHE_FILE_GZ = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".profiles_cache.json.gz")
+
+_SECTOR_DE_MAP = {
+    "Technology": "Technologie",
+    "Communication Services": "Kommunikation & Medien",
+    "Consumer Cyclical": "Zyklischer Konsum",
+    "Consumer Defensive": "Basiskonsum",
+    "Healthcare": "Gesundheit & Biotech",
+    "Financial Services": "Finanzen",
+    "Industrials": "Industrie",
+    "Energy": "Energie",
+    "Basic Materials": "Rohstoffe",
+    "Utilities": "Versorger & Strom",
+    "Real Estate": "Immobilien",
+}
+
+_INDUSTRY_DE_MAP = {
+    "Semiconductors": "Halbleiter & Chips",
+    "Semiconductor Equipment & Materials": "Chip-Ausrüster",
+    "Software - Infrastructure": "Cloud & Infrastruktur-Software",
+    "Software - Application": "Enterprise- & SaaS-Software",
+    "Consumer Electronics": "Consumer-Elektronik & Ökosystem",
+    "Internet Content & Information": "Internet-Plattform & KI",
+    "Internet Retail": "E-Commerce & Online-Handel",
+    "Advertising Agencies": "KI-Werbung & AdTech",
+    "Biotechnology": "Biotechnologie",
+    "Drug Manufacturers - General": "Pharma-Konzern",
+    "Medical Devices": "Medizintechnik",
+    "Medical Instruments & Supplies": "Medizin- & Labortechnik",
+    "Diagnostics & Research": "Diagnostik & Life-Science",
+    "Healthcare Plans": "Krankenversicherung & Health",
+    "Banks - Diversified": "Großbank",
+    "Banks - Regional": "Regionalbank",
+    "Capital Markets": "Brokerage & Kapitalmarkt",
+    "Asset Management": "Vermögensverwaltung",
+    "Credit Services": "Zahlungsdienst & FinTech",
+    "Oil & Gas Integrated": "Integrierter Öl- & Gaskonzern",
+    "Oil & Gas E&P": "Öl- & Gasförderung",
+    "Oil & Gas Equipment & Services": "Ölfeld-Service",
+    "Oil & Gas Midstream": "Energie-Pipelines",
+    "Oil & Gas Refining & Marketing": "Raffinerie & Kraftstoffe",
+    "Uranium": "Uran & Kernenergie",
+    "Utilities - Independent Power Producers": "Stromerzeugung & Rechenzentren-Power",
+    "Aerospace & Defense": "Luft-, Raumfahrt & Verteidigung",
+    "Auto Manufacturers": "Automobil & E-Mobilität",
+    "Airlines": "Fluggesellschaft",
+    "Travel Services": "Reise- & Buchungsplattform",
+    "Restaurants": "Systemgastronomie",
+    "Apparel Retail": "Mode- & Einzelhandel",
+    "Footwear & Accessories": "Schuhe & Sportmarken",
+    "Specialty Retail": "Spezial-Einzelhandel",
+    "Discount Stores": "Handelsriese",
+    "Telecom Services": "Telekommunikation",
+    "Entertainment": "Streaming & Entertainment",
+    "Electronic Gaming & Multimedia": "Gaming & Interactive",
+    "Specialty Industrial Machinery": "Industriemaschinen & Automation",
+    "Electrical Equipment & Parts": "Elektrotechnik & Rechenzentren",
+    "Solar": "Solartechnik",
+    "Gold": "Gold- & Edelmetall-Mining",
+    "Copper": "Kupfer & Rohstoffe",
+    "Steel": "Stahlproduktion",
+    "Insurance - Property & Casualty": "Versicherung",
+    "Insurance - Life": "Lebensversicherung",
+}
+
+
+def _get_yahoo_session_and_crumb(force_refresh: bool = False) -> tuple[requests.Session, str]:
     global _YAHOO_SESS, _YAHOO_CRUMB, _YAHOO_TS
     import time as _t
-    now = _t.time()
-    if _YAHOO_SESS is not None and _YAHOO_CRUMB and (now - _YAHOO_TS) < 1800:
-        return _YAHOO_SESS, _YAHOO_CRUMB
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Cache-Control": "no-cache, no-store, must-revalidate",
-        "Pragma": "no-cache",
-    })
-    try:
-        sess.get("https://fc.yahoo.com", timeout=6)
-        crumb_resp = sess.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=6)
-        crumb = crumb_resp.text.strip() if crumb_resp.status_code == 200 else ""
-        if crumb:
-            _YAHOO_SESS = sess
-            _YAHOO_CRUMB = crumb
-            _YAHOO_TS = now
-        return sess, crumb
-    except Exception:
-        return sess, ""
+    with _YAHOO_LOCK:
+        now = _t.time()
+        if not force_refresh and _YAHOO_SESS is not None and _YAHOO_CRUMB and (now - _YAHOO_TS) < 1200:
+            return _YAHOO_SESS, _YAHOO_CRUMB
+        user_agents = [
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
+        ]
+        for attempt in range(3):
+            sess = requests.Session()
+            sess.headers.update({
+                "User-Agent": user_agents[attempt % len(user_agents)],
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+            })
+            try:
+                sess.get("https://fc.yahoo.com", timeout=7)
+                host = "query1.finance.yahoo.com" if attempt % 2 == 0 else "query2.finance.yahoo.com"
+                crumb_resp = sess.get(f"https://{host}/v1/test/getcrumb", timeout=7)
+                crumb = crumb_resp.text.strip() if crumb_resp.status_code == 200 else ""
+                if crumb and "Too Many Requests" not in crumb and "<html" not in crumb.lower():
+                    _YAHOO_SESS = sess
+                    _YAHOO_CRUMB = crumb
+                    _YAHOO_TS = _t.time()
+                    return sess, crumb
+            except Exception:
+                pass
+            _t.sleep(1.0 * (attempt + 1))
+        return (_YAHOO_SESS or requests.Session()), _YAHOO_CRUMB
+
+
+def _has_real_fundamentals(item: dict | None) -> bool:
+    if not isinstance(item, dict):
+        return False
+    return any(item.get(k) is not None for k in ("marketCap", "trailingPE", "forwardPE", "epsTrailingTwelveMonths", "displayName", "shortName"))
+
+
+def _load_fundamentals_cache() -> dict[str, dict]:
+    global _FUND_CACHE_MEM
+    with _FUND_CACHE_LOCK:
+        if _FUND_CACHE_MEM:
+            return _FUND_CACHE_MEM
+        if os.path.exists(_FUND_CACHE_FILE_GZ):
+            try:
+                with gzip.open(_FUND_CACHE_FILE_GZ, "rt", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict) and isinstance(raw.get("data"), dict):
+                    _FUND_CACHE_MEM = raw["data"]
+            except Exception:
+                pass
+        return _FUND_CACHE_MEM
+
+
+def _save_fundamentals_cache(data: dict[str, dict]) -> None:
+    if not data:
+        return
+    rich_items = {k: v for k, v in data.items() if _has_real_fundamentals(v)}
+    if len(rich_items) < 50:
+        return
+    with _FUND_CACHE_LOCK:
+        for k, v in rich_items.items():
+            _FUND_CACHE_MEM[k] = v
+        try:
+            tmp = _FUND_CACHE_FILE_GZ + ".tmp"
+            with gzip.open(tmp, "wt", encoding="utf-8") as f:
+                json.dump({"date": date.today().isoformat(), "data": _FUND_CACHE_MEM}, f, separators=(",", ":"))
+            os.replace(tmp, _FUND_CACHE_FILE_GZ)
+        except Exception:
+            pass
+
+
+def _load_profile_cache() -> dict[str, dict]:
+    global _PROFILE_CACHE_MEM
+    with _PROFILE_CACHE_LOCK:
+        if _PROFILE_CACHE_MEM:
+            return _PROFILE_CACHE_MEM
+        if os.path.exists(_PROFILE_CACHE_FILE_GZ):
+            try:
+                with gzip.open(_PROFILE_CACHE_FILE_GZ, "rt", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict) and isinstance(raw.get("data"), dict):
+                    _PROFILE_CACHE_MEM = raw["data"]
+            except Exception:
+                pass
+        return _PROFILE_CACHE_MEM
+
+
+def _save_profile_cache() -> None:
+    with _PROFILE_CACHE_LOCK:
+        if not _PROFILE_CACHE_MEM:
+            return
+        try:
+            tmp = _PROFILE_CACHE_FILE_GZ + ".tmp"
+            with gzip.open(tmp, "wt", encoding="utf-8") as f:
+                json.dump({"date": date.today().isoformat(), "data": _PROFILE_CACHE_MEM}, f, separators=(",", ":"))
+            os.replace(tmp, _PROFILE_CACHE_FILE_GZ)
+        except Exception:
+            pass
+
+
+def _compress_business_summary(raw_summary: str, sym: str, industry: str, sector: str) -> str:
+    """Extrahiert einen knackigen, schnell lesbaren Kernsatz zum Geschäftsmodell (max. ~92 Zeichen)."""
+    import re as _re
+    s = (raw_summary or "").strip()
+    if s:
+        m = _re.split(r"(?<=[.!?])\s+(?=[A-Z])", s, maxsplit=1)
+        first = m[0].strip()
+        # Entferne Firmennamen-Vorspann bis zum ersten Verb (designs, provides, operates, engages, develops, ...)
+        verb_m = _re.search(
+            r"\b(designs|provides|operates|engages|develops|manufactures|offers|produces|delivers|builds|creates|distributes|markets|sells|explores|mines|generates|acquires|owns|manages|supplies|focuses|specializes|is a|is an|functions|serves)\b",
+            first,
+            flags=_re.IGNORECASE,
+        )
+        if verb_m and verb_m.start() <= 90:
+            first = first[verb_m.start():].strip()
+        first = first.rstrip(".")
+        if len(first) > 95:
+            cut = first[:92].rsplit(" ", 1)[0]
+            first = cut.rstrip(",;:-") + "…"
+        if first and len(first) >= 16:
+            return first[0].upper() + first[1:]
+    ind_de = _INDUSTRY_DE_MAP.get(industry, industry)
+    sec_de = _SECTOR_DE_MAP.get(sector, sector)
+    if ind_de and sec_de and ind_de != sec_de:
+        return f"{ind_de} ({sec_de})"
+    return ind_de or sec_de or f"US-Börsenunternehmen ({sym})"
+
+
+def fetch_company_profiles(symbols: list[str]) -> dict[str, dict]:
+    """
+    Holt für alle Watchlist-Titel (mit 14-Tage-Disk-Cache .profiles_cache.json.gz)
+    Sektor, Branche, Kerngeschäfts-Kurzbeschreibung, Umsatzwachstum, Gewinnmarge,
+    Kursziel und ergänzende Fundamentaldaten über Yahoo quoteSummary.
+    """
+    import time as _t
+    cache = _load_profile_cache()
+    now_ts = int(_t.time())
+    ttl_sec = 14 * 86400
+    to_fetch = []
+    for s in symbols:
+        c = cache.get(s)
+        if not c or (now_ts - int(c.get("ts") or 0)) > ttl_sec or not c.get("summary_short"):
+            to_fetch.append(s)
+
+    if to_fetch:
+        sess, crumb = _get_yahoo_session_and_crumb()
+
+        def _fetch_one_prof(sym: str) -> tuple[str, dict | None]:
+            nonlocal sess, crumb
+            for attempt in range(2):
+                try:
+                    host = "query1.finance.yahoo.com" if attempt == 0 else "query2.finance.yahoo.com"
+                    r = sess.get(
+                        f"https://{host}/v10/finance/quoteSummary/{sym}",
+                        params={
+                            "modules": "assetProfile,financialData,defaultKeyStatistics,calendarEvents,summaryDetail",
+                            "crumb": crumb,
+                        },
+                        timeout=8,
+                    )
+                    if r.status_code in (401, 403):
+                        sess, crumb = _get_yahoo_session_and_crumb(force_refresh=True)
+                        continue
+                    if r.status_code != 200:
+                        continue
+                    res_arr = (r.json().get("quoteSummary") or {}).get("result") or []
+                    if not res_arr:
+                        return sym, None
+                    r0 = res_arr[0]
+                    ap = r0.get("assetProfile") or {}
+                    fd = r0.get("financialData") or {}
+                    ks = r0.get("defaultKeyStatistics") or {}
+                    sd = r0.get("summaryDetail") or {}
+                    ce = r0.get("calendarEvents") or {}
+
+                    def _raw(obj, key):
+                        v = obj.get(key)
+                        if isinstance(v, dict):
+                            return v.get("raw")
+                        return v
+
+                    sector = str(ap.get("sector") or "").strip()
+                    industry = str(ap.get("industry") or "").strip()
+                    raw_sum = str(ap.get("longBusinessSummary") or "").strip()
+                    earn_dates = ((ce.get("earnings") or {}).get("earningsDate") or [])
+                    next_earn_ts = None
+                    if earn_dates and isinstance(earn_dates[0], dict):
+                        next_earn_ts = earn_dates[0].get("raw")
+
+                    prof = {
+                        "ts": now_ts,
+                        "sector": sector,
+                        "sector_de": _SECTOR_DE_MAP.get(sector, sector),
+                        "industry": industry,
+                        "industry_de": _INDUSTRY_DE_MAP.get(industry, industry),
+                        "summary_short": _compress_business_summary(raw_sum, sym, industry, sector),
+                        "rev_growth": _raw(fd, "revenueGrowth"),
+                        "earn_growth": _raw(fd, "earningsGrowth"),
+                        "profit_margin": _raw(fd, "profitMargins"),
+                        "target_mean": _raw(fd, "targetMeanPrice"),
+                        "rec_key": str(fd.get("recommendationKey") or "").strip(),
+                        "fwd_pe": _raw(ks, "forwardPE") or _raw(sd, "forwardPE"),
+                        "trailing_pe": _raw(sd, "trailingPE"),
+                        "price_to_sales": _raw(sd, "priceToSalesTrailing12Months"),
+                        "beta": _raw(ks, "beta") or _raw(sd, "beta"),
+                        "next_earn_ts": next_earn_ts,
+                    }
+                    return sym, prof
+                except Exception:
+                    pass
+            return sym, None
+
+        workers = 4 if os.environ.get("RENDER") else 6
+        updated = False
+        done_cnt = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for sym_k, prof in pool.map(_fetch_one_prof, to_fetch):
+                if prof:
+                    with _PROFILE_CACHE_LOCK:
+                        _PROFILE_CACHE_MEM[sym_k] = prof
+                    updated = True
+                    done_cnt += 1
+                    if done_cnt % 60 == 0:
+                        _save_profile_cache()
+        if updated:
+            _save_profile_cache()
+
+    return _load_profile_cache()
+
+
+def build_company_bullets(sym: str, fund: dict, prof: dict | None, last_close: float) -> list[str]:
+    """
+    Erzeugt 2–3 ultrakurze Stichpunkte direkt unter dem Ticker:
+      1. Sektor & Kerngeschäft (Was macht das Unternehmen?)
+      2. Aktuelle Entwicklung (Umsatz-, EPS-Wachstum / Marge)
+      3. Aktuelle Chance / Treiber (Analysten-Kursziel-Potenzial, 52W-Rabatt oder Dividende)
+    """
+    bullets: list[str] = []
+    prof = prof or {}
+    ind_de = prof.get("industry_de") or prof.get("sector_de") or ""
+    sum_short = prof.get("summary_short") or ""
+    if ind_de and sum_short and ind_de.lower() not in sum_short.lower():
+        bullets.append(f"{ind_de}: {sum_short}")
+    elif sum_short:
+        bullets.append(sum_short)
+    elif ind_de:
+        bullets.append(ind_de)
+
+    # Stichpunkt 2: Entwicklung (Umsatz / Gewinn / Marge)
+    dev_parts = []
+    rg = prof.get("rev_growth")
+    if isinstance(rg, (int, float)) and abs(rg) < 10.0:
+        dev_parts.append(f"Umsatz {rg * 100:+.1f}% YoY")
+    eps_g = fund.get("eps_growth_pct")
+    if isinstance(eps_g, (int, float)):
+        dev_parts.append(f"EPS {eps_g:+.1f}% FY2")
+    pm = prof.get("profit_margin")
+    if isinstance(pm, (int, float)) and -2.0 < pm < 1.0:
+        if pm > 0:
+            dev_parts.append(f"Marge {pm * 100:.0f}%")
+        elif not dev_parts:
+            dev_parts.append("Wachstumsphase (noch defizitär)")
+    if dev_parts:
+        bullets.append(" · ".join(dev_parts[:2]))
+
+    # Stichpunkt 3: Chancen & Katalysatoren
+    opp_parts = []
+    tgt = prof.get("target_mean")
+    if isinstance(tgt, (int, float)) and tgt > 0 and last_close > 0:
+        up_pct = ((tgt - last_close) / last_close) * 100.0
+        if -50.0 <= up_pct <= 250.0:
+            opp_parts.append(f"Ziel {tgt:.0f}$ ({up_pct:+.0f}%)")
+    disc = fund.get("discount_52w_pct")
+    if isinstance(disc, (int, float)) and disc <= -15.0:
+        opp_parts.append(f"52W-Rabatt {disc:.0f}%")
+    elif fund.get("div_str"):
+        opp_parts.append(fund["div_str"])
+    elif prof.get("rec_key") and prof["rec_key"] not in ("none", ""):
+        rec_map = {"strong_buy": "Strong Buy", "buy": "Buy", "hold": "Hold", "underperform": "Underperform", "sell": "Sell"}
+        opp_parts.append(f"Konsens: {rec_map.get(prof['rec_key'], prof['rec_key'].title())}")
+    if opp_parts:
+        bullets.append(" · ".join(opp_parts[:2]))
+
+    return bullets[:3]
 
 
 def fetch_batch_quotes_and_fundamentals(symbols: list[str], eod_key: str = DEFAULT_EODHD_KEY) -> dict[str, dict]:
     """
-    Holt für alle übergebenen Symbole in wenigen Millisekunden:
-      1. Den sekundengenauen Echtzeit-Kurs (regularMarketPrice, Open, High, Low, Change%)
-      2. Die aktuellen Fundamental- & Unternehmenszahlen (KGV, Forward-KGV, EPS-Wachstum,
-         Analysten-Rating, 52W-Hoch/Tief, Dividende, Marktkapitalisierung, Earnings-Termin, Corporate Actions).
-    Nutzt zusätzlich EODHD Real-Time als Fallback, damit immer die aktuellsten Live-Kurse vorliegen.
+    Holt für alle übergebenen Symbole zuverlässig und 3-fach abgesichert:
+      1. Yahoo Finance Live Batch Quote + Fundamentals (mit automatischem Crumb-Refresh, 3x Retry & Host-Fallback)
+      2. EODHD Real-Time Bulk-Ergänzung (falls einzelne Live-Preise fehlen)
+      3. Persistenter Fundamental-Cache-Fallback (.fundamentals_cache.json.gz), damit ein kurzzeitiges
+         API-Rate-Limit niemals bestehende Fundamentaldaten mit 'n/a' überschreibt!
     """
     import time
     out: dict[str, dict] = {}
     clean_syms = [s.replace(".US", "") if s.upper().endswith(".US") else s for s in symbols]
+    cached_fund = _load_fundamentals_cache()
 
-    # 1. Yahoo Finance Live Batch Quote + Fundamentals (mit Crumb & Cache-Busting)
-    try:
-        sess, crumb = _get_yahoo_session_and_crumb()
-
-        batch_size = 80
-        for idx in range(0, len(clean_syms), batch_size):
-            chunk = clean_syms[idx : idx + batch_size]
-            params = {
-                "symbols": ",".join(chunk),
-                "crumb": crumb,
-                "_t": int(time.time() * 1000),
-            }
-            r = sess.get("https://query1.finance.yahoo.com/v7/finance/quote", params=params, timeout=12)
-            if r.status_code == 200:
-                items = r.json().get("quoteResponse", {}).get("result", [])
-                for item in items:
-                    sym_k = item.get("symbol")
-                    if sym_k:
-                        out[sym_k] = item
-    except Exception:
-        pass
+    # 1. Yahoo Finance Live Batch Quote + Fundamentals (mit Retry, Crumb-Erneuerung & query1/query2 Fallback)
+    sess, crumb = _get_yahoo_session_and_crumb()
+    batch_size = 55
+    for idx in range(0, len(clean_syms), batch_size):
+        chunk = clean_syms[idx : idx + batch_size]
+        fetched_chunk = False
+        for attempt in range(3):
+            try:
+                if attempt > 0:
+                    sess, crumb = _get_yahoo_session_and_crumb(force_refresh=True)
+                host = "query1.finance.yahoo.com" if attempt % 2 == 0 else "query2.finance.yahoo.com"
+                params = {
+                    "symbols": ",".join(chunk),
+                    "crumb": crumb,
+                    "_t": int(time.time() * 1000),
+                }
+                r = sess.get(f"https://{host}/v7/finance/quote", params=params, timeout=12)
+                if r.status_code == 200:
+                    items = r.json().get("quoteResponse", {}).get("result", [])
+                    for item in items:
+                        sym_k = item.get("symbol")
+                        if sym_k:
+                            out[sym_k] = item
+                    if items:
+                        fetched_chunk = True
+                        break
+                elif r.status_code in (401, 403, 429):
+                    time.sleep(0.6 * (attempt + 1))
+            except Exception:
+                time.sleep(0.5 * (attempt + 1))
+        if not fetched_chunk:
+            # Fallback auf letzte bekannte Fundamentaldaten für diesen Chunk
+            for s in chunk:
+                if s in cached_fund and s not in out:
+                    out[s] = dict(cached_fund[s])
 
     # 2. EODHD Real-Time Bulk-Ergänzung (falls für einzelne Symbole kein Live-Preis kam)
     missing = [s for s in clean_syms if s not in out or not out[s].get("regularMarketPrice")]
     if missing and eod_key:
         try:
-            batch_size = 40
-            for idx in range(0, len(missing), batch_size):
-                chunk = missing[idx : idx + batch_size]
+            batch_size_eod = 40
+            for idx in range(0, len(missing), batch_size_eod):
+                chunk = missing[idx : idx + batch_size_eod]
                 first = f"{chunk[0]}.US"
                 extra = ",".join(f"{c}.US" for c in chunk[1:])
                 params = {"api_token": eod_key, "fmt": "json", "_t": int(time.time())}
@@ -178,18 +549,34 @@ def fetch_batch_quotes_and_fundamentals(symbols: list[str], eod_key: str = DEFAU
                         close_v = row.get("close")
                         if code and close_v not in (None, "NA", 0, "0"):
                             c_f = float(close_v)
-                            out.setdefault(code, {})
-                            out[code]["regularMarketPrice"] = c_f
+                            base_item = dict(cached_fund.get(code) or {})
+                            base_item.update(out.get(code) or {})
+                            base_item["regularMarketPrice"] = c_f
                             if row.get("open") not in (None, "NA", 0):
-                                out[code]["regularMarketOpen"] = float(row["open"])
+                                base_item["regularMarketOpen"] = float(row["open"])
                             if row.get("high") not in (None, "NA", 0):
-                                out[code]["regularMarketDayHigh"] = float(row["high"])
+                                base_item["regularMarketDayHigh"] = float(row["high"])
                             if row.get("low") not in (None, "NA", 0):
-                                out[code]["regularMarketDayLow"] = float(row["low"])
+                                base_item["regularMarketDayLow"] = float(row["low"])
                             if row.get("change_p") not in (None, "NA"):
-                                out[code]["regularMarketChangePercent"] = float(row["change_p"])
+                                base_item["regularMarketChangePercent"] = float(row["change_p"])
+                            out[code] = base_item
         except Exception:
             pass
+
+    # 3. Ergänze fehlende Fundamentaldaten aus Cache + speichere frischen Snapshot
+    for s in clean_syms:
+        if s in out and s in cached_fund:
+            for fk in ("trailingPE", "forwardPE", "epsTrailingTwelveMonths", "epsCurrentYear", "epsForward",
+                       "marketCap", "averageAnalystRating", "earningsTimestamp", "earningsTimestampStart",
+                       "fiftyTwoWeekHigh", "fiftyTwoWeekLow", "displayName", "shortName"):
+                if out[s].get(fk) is None and cached_fund[s].get(fk) is not None:
+                    out[s][fk] = cached_fund[s][fk]
+        elif s not in out and s in cached_fund:
+            out[s] = dict(cached_fund[s])
+
+    if len(out) >= int(len(clean_syms) * 0.7):
+        _save_fundamentals_cache(out)
 
     return out
 
@@ -242,7 +629,7 @@ def _merge_live_quote_into_candles(candles: list, live_quote: dict | None, perio
     return candles
 
 
-def fetch_candles_yahoo(symbol: str, interval: str = "1d", range_str: str = "2y") -> list:
+def fetch_candles_yahoo(symbol: str, interval: str = "1d", range_str: str = "3y") -> list:
     import time
     clean_sym = symbol.replace(".US", "") if symbol.upper().endswith(".US") else symbol
     url = f"{YAHOO_CHART_BASE}/{clean_sym}"
@@ -300,7 +687,7 @@ def fetch_candles_yahoo(symbol: str, interval: str = "1d", range_str: str = "2y"
     return candles
 
 
-def fetch_candles_eodhd(symbol: str, api_key: str, period: str = "d", days: int = 730) -> list:
+def fetch_candles_eodhd(symbol: str, api_key: str, period: str = "d", days: int = 1120) -> list:
     import time
     eod_sym = symbol if "." in symbol else f"{symbol}.US"
     to_d = date.today()
@@ -363,14 +750,42 @@ def fetch_candles_eodhd(symbol: str, api_key: str, period: str = "d", days: int 
     return candles
 
 
-import gzip
-import threading
-
 _CANDLE_CACHE_LOCK = threading.Lock()
 _CANDLE_CACHE_MEM: dict[str, list] = {}
 _CANDLE_CACHE_DIRTY = False
 _CANDLE_CACHE_FILE_GZ = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".candle_cache_d.json.gz")
 _CANDLE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".candle_cache_d.json")
+
+
+def _expected_latest_completed_trading_day() -> date:
+    """Bestimmt den letzten abgeschlossenen US-Handelstag (Mo-Fr, ohne Wochenenden)."""
+    d = date.today() - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def _is_candle_cache_fresh(cached: list | None) -> bool:
+    """
+    Prüft ob der RAM-/Disk-Kerzen-Cache sowohl aktuell als auch vollständig (3 Jahre Historie) ist:
+    - Mindestens 660 Kerzen (bei jungen IPOs mit <3J Historie genügt Aktualität, wenn älteste Kerze > 2023-12)
+    - Letzte Kerze darf maximal 2 Kalendertage hinter dem letzten abgeschlossenen Handelstag liegen
+      (berücksichtigt US-Feiertage wie Thanksgiving).
+    """
+    if not cached or len(cached) < 60:
+        return False
+    try:
+        last_dt = date.fromisoformat(str(cached[-1]["time"]))
+        first_dt = date.fromisoformat(str(cached[0]["time"]))
+    except Exception:
+        return False
+    # Erzwinge einmaliges Upgrade vom alten 2-Jahres-Cache auf die neue 3-Jahres-Historie:
+    min_3y_target = date.today() - timedelta(days=950)
+    if len(cached) < 660 and first_dt > min_3y_target and first_dt < (date.today() - timedelta(days=500)):
+        return False
+    exp_dt = _expected_latest_completed_trading_day()
+    # Maximal 2 Tage Spielraum (z.B. US-Feiertag wie Thanksgiving Donnerstag)
+    return (exp_dt - last_dt).days <= 2
 
 
 def _load_candle_cache() -> None:
@@ -379,20 +794,17 @@ def _load_candle_cache() -> None:
         return
     try:
         import time as _t
-        if os.path.exists(_CANDLE_CACHE_FILE_GZ) and (_t.time() - os.path.getmtime(_CANDLE_CACHE_FILE_GZ)) < 345600:
+        if os.path.exists(_CANDLE_CACHE_FILE_GZ) and (_t.time() - os.path.getmtime(_CANDLE_CACHE_FILE_GZ)) < 432000:
             with gzip.open(_CANDLE_CACHE_FILE_GZ, "rt", encoding="utf-8") as f:
                 payload = json.load(f)
             if isinstance(payload.get("data"), dict) and len(payload["data"]) >= 50:
                 _CANDLE_CACHE_MEM = payload["data"]
                 return
-        if os.path.exists(_CANDLE_CACHE_FILE) and (_t.time() - os.path.getmtime(_CANDLE_CACHE_FILE)) < 345600:
+        if os.path.exists(_CANDLE_CACHE_FILE) and (_t.time() - os.path.getmtime(_CANDLE_CACHE_FILE)) < 432000:
             with open(_CANDLE_CACHE_FILE, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             if isinstance(payload.get("data"), dict) and len(payload["data"]) >= 50:
                 _CANDLE_CACHE_MEM = payload["data"]
-                if not os.path.exists(_CANDLE_CACHE_FILE_GZ):
-                    with gzip.open(_CANDLE_CACHE_FILE_GZ, "wt", encoding="utf-8") as gz:
-                        json.dump(payload, gz, separators=(",", ":"))
     except Exception:
         pass
 
@@ -420,15 +832,15 @@ def fetch_candles(symbol: str, period: str = "d", live_quote: dict | None = None
     if period == "d" and os.getenv("UMWA_FORCE_FRESH") != "1":
         with _CANDLE_CACHE_LOCK:
             cached = _CANDLE_CACHE_MEM.get(symbol)
-        if cached and len(cached) >= 60:
+        if _is_candle_cache_fresh(cached):
             candles_copy = [dict(c) for c in cached]
             candles_copy = _merge_live_quote_into_candles(candles_copy, live_quote, period=period)
             return candles_copy, "EODHD+SmartCache+Live"
 
-    # Primär EODHD + Live-Quote-Fusion für maximale Konsistenz, Fallback Yahoo Finance
+    # Primär EODHD (volle 3-Jahres-Historie = 1120 Tage) + Live-Quote-Fusion, Fallback Yahoo Finance 3y
     if eod_key:
         try:
-            candles = fetch_candles_eodhd(symbol, eod_key, period=period, days=730)
+            candles = fetch_candles_eodhd(symbol, eod_key, period=period, days=1120)
             if candles and len(candles) >= 60:
                 if period == "d":
                     with _CANDLE_CACHE_LOCK:
@@ -439,13 +851,23 @@ def fetch_candles(symbol: str, period: str = "d", live_quote: dict | None = None
         except Exception:
             pass
 
-    candles = fetch_candles_yahoo(symbol, interval=yf_interval, range_str="2y")
-    if period == "d" and candles and len(candles) >= 60:
+    try:
+        candles = fetch_candles_yahoo(symbol, interval=yf_interval, range_str="3y")
+        if period == "d" and candles and len(candles) >= 60:
+            with _CANDLE_CACHE_LOCK:
+                _CANDLE_CACHE_MEM[symbol] = [dict(c) for c in candles]
+                _CANDLE_CACHE_DIRTY = True
+        candles = _merge_live_quote_into_candles(candles, live_quote, period=period)
+        return candles, "Yahoo+Live"
+    except Exception:
+        # Notfall-Fallback: falls API kurz ausfällt, wenigstens vorhandenen Cache nutzen
         with _CANDLE_CACHE_LOCK:
-            _CANDLE_CACHE_MEM[symbol] = [dict(c) for c in candles]
-            _CANDLE_CACHE_DIRTY = True
-    candles = _merge_live_quote_into_candles(candles, live_quote, period=period)
-    return candles, "Yahoo+Live"
+            cached = _CANDLE_CACHE_MEM.get(symbol)
+        if cached and len(cached) >= 60:
+            candles_copy = [dict(c) for c in cached]
+            candles_copy = _merge_live_quote_into_candles(candles_copy, live_quote, period=period)
+            return candles_copy, "SmartCache-Fallback"
+        raise
 
 
 # =====================================================================
@@ -628,28 +1050,54 @@ def find_validated_sr_lines(
         if is_st_high and not any(p["idx"] == i and p["kind"] == "H" for p in raw_pivots):
             raw_pivots.append({"idx": i, "price": hi, "kind": "H", "time": candles[i]["time"], "major": False})
 
-    # Explizite 1-Monats (22T) und 3-Monats (65T) Range-Tops & Range-Lows ergänzen,
-    # damit markante kurzfristige Hochs und Tiefs niemals übersehen werden:
-    for win_len in (22, 65):
-        if n > win_len + 2:
-            w_slice = candles[n - win_len : n - 1]
-            if w_slice:
-                min_idx = min(range(n - win_len, n - 1), key=lambda k: candles[k]["low"])
-                max_idx = max(range(n - win_len, n - 1), key=lambda k: candles[k]["high"])
-                lo_v = float(candles[min_idx]["low"])
-                hi_v = float(candles[max_idx]["high"])
-                if not any(abs(p["idx"] - min_idx) <= 2 and p["kind"] == "L" for p in raw_pivots):
-                    raw_pivots.append({"idx": min_idx, "price": lo_v, "kind": "L", "time": candles[min_idx]["time"], "major": False})
-                if not any(abs(p["idx"] - max_idx) <= 2 and p["kind"] == "H" for p in raw_pivots):
-                    raw_pivots.append({"idx": max_idx, "price": hi_v, "kind": "H", "time": candles[max_idx]["time"], "major": False})
+    # Explizite 1-Monats (22T), 3-Monats (65T), 6-Monats (126T), 1-Jahres (252T) und 3-Jahres (Gesamt)
+    # Range-Tops & Range-Lows ergänzen – logische Extremmarken, die im Chart immer sichtbar sein müssen:
+    logical_peaks = []
+    for win_len, win_tag in ((22, "1M"), (65, "3M"), (126, "6M"), (252, "1J"), (n - 1, "3J")):
+        eff_len = min(win_len, n - 1)
+        if eff_len >= 15:
+            s_i = max(0, n - 1 - eff_len)
+            min_idx = min(range(s_i, n - 1), key=lambda k: candles[k]["low"])
+            max_idx = max(range(s_i, n - 1), key=lambda k: candles[k]["high"])
+            lo_v = float(candles[min_idx]["low"])
+            hi_v = float(candles[max_idx]["high"])
+            logical_peaks.append({"idx": min_idx, "price": lo_v, "kind": "L", "time": candles[min_idx]["time"], "major": True, "logical_peak": True, "win_tag": win_tag})
+            logical_peaks.append({"idx": max_idx, "price": hi_v, "kind": "H", "time": candles[max_idx]["time"], "major": True, "logical_peak": True, "win_tag": win_tag})
+            if not any(abs(p["idx"] - min_idx) <= 2 and p["kind"] == "L" for p in raw_pivots):
+                raw_pivots.append({"idx": min_idx, "price": lo_v, "kind": "L", "time": candles[min_idx]["time"], "major": True, "logical_peak": True})
+            if not any(abs(p["idx"] - max_idx) <= 2 and p["kind"] == "H" for p in raw_pivots):
+                raw_pivots.append({"idx": max_idx, "price": hi_v, "kind": "H", "time": candles[max_idx]["time"], "major": True, "logical_peak": True})
 
-    # Relevanter Preisbereich: +/- 38% um den aktuellen Kurs
-    lo_bound = current_price * 0.62
-    hi_bound = current_price * 1.38
+    # Zusätzliche markante Makro-Swing-Tops & -Böden (10L/10R) über die gesamte 3-Jahres-Historie,
+    # auch wenn ein markantes Top nur 1x angelaufen wurde (logische charttechnische Peaks):
+    for i in range(10, n - 10):
+        lo = float(candles[i]["low"])
+        hi = float(candles[i]["high"])
+        if all(candles[j]["high"] <= hi for j in range(i - 10, i + 11)):
+            win_min = min(candles[j]["low"] for j in range(max(0, i - 15), min(n, i + 16)))
+            if (hi - win_min) / max(hi, 1e-4) >= 0.065:
+                if not any(abs(p["idx"] - i) <= 2 and p["kind"] == "H" for p in raw_pivots):
+                    raw_pivots.append({"idx": i, "price": hi, "kind": "H", "time": candles[i]["time"], "major": True, "logical_peak": True})
+                else:
+                    for p in raw_pivots:
+                        if abs(p["idx"] - i) <= 2 and p["kind"] == "H":
+                            p["logical_peak"] = True
+        if all(candles[j]["low"] >= lo for j in range(i - 10, i + 11)):
+            win_max = max(candles[j]["high"] for j in range(max(0, i - 15), min(n, i + 16)))
+            if (win_max - lo) / max(lo, 1e-4) >= 0.065:
+                if not any(abs(p["idx"] - i) <= 2 and p["kind"] == "L" for p in raw_pivots):
+                    raw_pivots.append({"idx": i, "price": lo, "kind": "L", "time": candles[i]["time"], "major": True, "logical_peak": True})
+                else:
+                    for p in raw_pivots:
+                        if abs(p["idx"] - i) <= 2 and p["kind"] == "L":
+                            p["logical_peak"] = True
+
+    # Erweiterter Preisbereich für volle 3-Jahres-Ansicht (-55% bis +85% um den aktuellen Kurs)
+    lo_bound = current_price * 0.45
+    hi_bound = current_price * 1.85
     raw_pivots = [p for p in raw_pivots if lo_bound <= p["price"] <= hi_bound]
 
     # Clustern von nahe beieinander liegenden Pivots (Mindestabstand 4 Kerzen für unabhängigen Test)
-    # Jüngere Pivots zuerst sortieren, damit der Cluster-Anker exakt am aktuellen/jüngsten Swing-Level liegt
     raw_pivots.sort(key=lambda x: (-x["idx"], x["price"]))
     clusters = []
     for p in raw_pivots:
@@ -658,13 +1106,14 @@ def find_validated_sr_lines(
             mid = c["sum"] / c["count"]
             if abs(p["price"] - mid) / mid <= eff_tol:
                 if all(abs(p["idx"] - existing_idx) >= 4 for existing_idx in c["indices"]):
-                    # Jüngere Punkte stärker gewichten, damit die Linie präzise am aktuellen Top/Low sitzt
                     w = 1.35 if p["idx"] >= n - 65 else 1.0
                     c["sum"] += p["price"] * w
                     c["count"] += w
                     c["raw_count"] += 1
                     c["indices"].append(p["idx"])
                     c["times"].append(p["time"])
+                    if p.get("logical_peak"):
+                        c["logical_peak"] = True
                     if p["idx"] > c["last_idx"]:
                         c["last_idx"] = p["idx"]
                         c["recent_price"] = p["price"]
@@ -681,9 +1130,10 @@ def find_validated_sr_lines(
                 "last_idx": p["idx"],
                 "recent_price": p["price"],
                 "kind": p["kind"],
+                "logical_peak": bool(p.get("logical_peak")),
             })
 
-    # --- Stufe 2: Doppel-Check (Multi-Touch + Kurzfristige Swing-Tops & -Lows) ---
+    # --- Stufe 2: Doppel-Check (Multi-Touch + Kurzfristige Swings + Logische 3J/1J/6M Tops & Lows) ---
     validated_supports = []
     validated_resistances = []
 
@@ -692,17 +1142,17 @@ def find_validated_sr_lines(
         pivot_touches = c["raw_count"]
         last_p_idx = c["last_idx"]
         is_recent_swing = (last_p_idx >= n - 80)
+        is_logical_peak = bool(c.get("logical_peak"))
 
-        # Bei einem frischen kurzfristigen Top/Low exakt das jüngste Swing-Extrem als Linienpreis verwenden,
-        # damit die horizontale Linie im Chart haarfein auf der Kerzenspitze des Tops/Lows liegt!
-        if is_recent_swing and pivot_touches == 1:
+        # Bei einem frischen Top/Low oder logischen Einzel-Peak exakt die Kerzenspitze als Linienpreis nehmen!
+        if (is_recent_swing or is_logical_peak) and pivot_touches == 1:
             lvl = float(c["recent_price"])
         elif is_recent_swing and pivot_touches == 2:
             lvl = 0.70 * float(c["recent_price"]) + 0.30 * lvl
 
-        # Doppel-Check A: Zähle unabhängige Kerzen-Abpraller (Touch & Hold) an dieser Linie
+        # Doppel-Check A: Zähle unabhängige Kerzen-Abpraller (Touch & Hold) über bis zu 3 Jahre
         bounce_indices = []
-        for i in range(max(0, n - 260), n):
+        for i in range(max(0, n - 756), n):
             hi, lo, cl, op = candles[i]["high"], candles[i]["low"], candles[i]["close"], candles[i]["open"]
             body_lo, body_hi = min(op, cl), max(op, cl)
 
@@ -723,10 +1173,10 @@ def find_validated_sr_lines(
             if (c_prev < lvl * 0.995 and c_curr > lvl * 1.005) or (c_prev > lvl * 1.005 and c_curr < lvl * 0.995):
                 crossings += 1
 
-        if crossings > 2:
+        if crossings > 2 and not is_logical_peak:
             continue
 
-        # Prüfung 1: Klassische mehrfach bestätigte Struktur-Linie (2J)
+        # Prüfung 1: Klassische mehrfach bestätigte Struktur-Linie (3J)
         is_valid_major = (pivot_touches >= 2 and len(bounce_indices) >= 2) or (pivot_touches >= 1 and len(bounce_indices) >= 3)
 
         # Prüfung 2: Wichtiges kurzfristiges Top oder Low (letzte 80 Handelstage)
@@ -742,17 +1192,28 @@ def find_validated_sr_lines(
                 if rebound_pct >= min_rebound:
                     is_valid_short_term = True
 
-        if not (is_valid_major or is_valid_short_term):
+        # Prüfung 3: Logisches Struktur-Top / Struktur-Low (z.B. 3J-Hoch, 1J-Hoch, 6M-Hoch oder 10L/10R Makro-Peak)
+        is_valid_peak = bool(is_logical_peak and crossings <= 2)
+
+        if not (is_valid_major or is_valid_short_term or is_valid_peak):
             continue
 
         bounces_cnt = max(len(bounce_indices), pivot_touches)
         recency_bonus = 4 if last_p_idx >= n - 35 else (2 if last_p_idx >= n - 80 else 0)
+        peak_bonus = 3 if is_valid_peak else 0
+        if is_valid_major:
+            h_label = "major"
+        elif is_valid_peak and not is_recent_swing:
+            h_label = "peak"
+        else:
+            h_label = "short"
+
         line_info = {
             "price": round(lvl, 2),
             "pivots": pivot_touches,
             "bounces": bounces_cnt,
-            "horizon": "short" if (is_valid_short_term and not is_valid_major) else "major",
-            "strength": pivot_touches * 2 + bounces_cnt + recency_bonus,
+            "horizon": h_label,
+            "strength": pivot_touches * 2 + bounces_cnt + recency_bonus + peak_bonus,
             "dist_pct": round((lvl - current_price) / current_price * 100.0, 2),
         }
 
@@ -761,8 +1222,7 @@ def find_validated_sr_lines(
         elif lvl > current_price * 1.0005:
             validated_resistances.append(line_info)
 
-    # Entdoppeln: Wenn zwei Linien extrem nah beieinander liegen (< min_line_gap),
-    # behalte die stärkere / aktuellere Linie, damit im Chart keine Doppellinien kleben
+    # Entdoppeln: Behalte stärkste/logischste Linien mit sauberem Mindestabstand
     def _dedup_lines(lines: list, reverse_sort: bool) -> list:
         lines_by_strength = sorted(lines, key=lambda x: (-x["strength"], abs(x["dist_pct"])))
         kept = []
@@ -785,7 +1245,7 @@ def find_validated_sr_lines(
     at_support = False
     active_support = None
     for s in validated_supports[:3]:
-        if recent_low_3 <= s["price"] * 1.012 and current_price >= s["price"] * 0.995:
+        if recent_low_3 <= s["price"] * 1.015 and current_price >= s["price"] * 0.994:
             at_support = True
             active_support = s
             break
@@ -793,14 +1253,14 @@ def find_validated_sr_lines(
     at_resistance = False
     active_resistance = None
     for r_lvl in validated_resistances[:3]:
-        if recent_high_3 >= r_lvl["price"] * 0.988 and current_price <= r_lvl["price"] * 1.005:
+        if recent_high_3 >= r_lvl["price"] * 0.985 and current_price <= r_lvl["price"] * 1.006:
             at_resistance = True
             active_resistance = r_lvl
             break
 
     return {
-        "supports": validated_supports[:7],
-        "resistances": validated_resistances[:7],
+        "supports": validated_supports[:10],
+        "resistances": validated_resistances[:10],
         "nearest_support": nearest_sup,
         "nearest_resistance": nearest_res,
         "at_support": at_support,
@@ -938,118 +1398,121 @@ def recommend_weekly_option(
     cycle_label: str = "",
     symbol: str = "",
     days_to_earnings: int | None = None,
-    min_prem_pct: float = 0.70,
-    max_prem_pct: float = 1.40,
+    min_prem_pct: float = 0.60,
+    max_prem_pct: float = 1.65,
     max_delta: float = 0.30,
     min_otm_pct: float = 0.020,
 ) -> dict:
     """
-    Sucht für Mo/Di -> Freitag auf echten, standardisierten OCC/IBKR-Options-Strikes
-    den sichersten Strike (kleinstes Delta <= 0.30, OTM >= 2.0%), der 0,7 % bis 1,4 %
-    Wochenprämie liefert, und gleicht ihn mit den validierten Support-/Resistance-Linien ab.
+    Feinabgestimmte Strike-Findung für Mo/Di -> Freitag auf echten OCC/IBKR-Strikes:
+      • Volatilitätsadaptiver OTM-Schutz (2,0% Standard, 3,0% bei IV > 45%, 4,5% bei IV > 65%)
+      • Priorisiert Strikes, die direkt hinter einer validierten 🔵 S/R-Linie geschützt sind
+      • Delta-Korridor 0,09 – 0,30 | Zielprämie 0,60 % – 1,65 % (Optimal 0,70 % – 1,45 %)
     """
     T = max(dte_days, 1) / 252.0
     r = 0.045
     inc = _get_strike_increment(S)
 
-    # Generiere alle echten Standard-Strikes zwischen 2,0 % und 12,5 % OTM (liquider Stillhalter-Korridor)
+    eff_min_otm = min_otm_pct
+    if iv >= 0.65:
+        eff_min_otm = max(min_otm_pct, 0.045)
+    elif iv >= 0.45:
+        eff_min_otm = max(min_otm_pct, 0.030)
+
     candidate_strikes = []
     if is_put:
-        k_start = _snap_to_standard_strike(S * (1.0 - min_otm_pct), S, is_put=True, min_otm_pct=min_otm_pct)
-        k_min = max(inc, S * 0.875)
+        k_start = _snap_to_standard_strike(S * (1.0 - eff_min_otm), S, is_put=True, min_otm_pct=eff_min_otm)
+        k_min = max(inc, S * 0.82)
         k_cur = k_start
         while k_cur >= k_min:
             candidate_strikes.append(round(k_cur, 2))
             k_cur -= inc
     else:
-        k_start = _snap_to_standard_strike(S * (1.0 + min_otm_pct), S, is_put=False, min_otm_pct=min_otm_pct)
-        k_max = S * 1.125
+        k_start = _snap_to_standard_strike(S * (1.0 + eff_min_otm), S, is_put=False, min_otm_pct=eff_min_otm)
+        k_max = S * 1.18
         k_cur = k_start
         while k_cur <= k_max:
             candidate_strikes.append(round(k_cur, 2))
             k_cur += inc
 
-    # Sortiere von weit OTM (sicherster Puffer) nach näher am Kurs (2% Minimum)
-    candidate_strikes_far_to_near = list(reversed(candidate_strikes))
-
-    best_high_iv = None
-    best_fallback = None
-    chosen = None
-
+    sr_supports = (sr_info or {}).get("supports") or []
+    sr_resistances = (sr_info or {}).get("resistances") or []
     exp_code = expiry_date.strftime("%d%b%y").upper() if expiry_date else "WEEKLY"
     right_code = "P" if is_put else "C"
 
-    for K in candidate_strikes_far_to_near:
+    qual_list = []
+    high_iv_list = []
+    best_fallback = None
+
+    for K in reversed(candidate_strikes):
         otm_pct = (S - K) / S if is_put else (K - S) / S
-        if otm_pct < min_otm_pct - 1e-4:
+        if otm_pct < eff_min_otm - 1e-4:
             continue
 
         if is_put:
             price, delta = _bs_put(S, K, T, r, sigma=iv)
             prem_pct = (price / K) * 100.0
+            prot = [s for s in sr_supports if K <= s["price"] <= S]
         else:
             price, delta = _bs_call(S, K, T, r, sigma=iv)
             prem_pct = (price / S) * 100.0
+            prot = [r_l for r_l in sr_resistances if S <= r_l["price"] <= K]
 
+        sr_prot = bool(prot)
+        sr_shield = max(prot, key=lambda x: x["strength"]) if prot else None
         contract_str = f"{symbol} {exp_code} {K:g} {right_code}".strip()
 
-        if delta <= max_delta:
-            best_fallback = {
-                "qualified": False,
-                "type": "SHORT PUT" if is_put else "SHORT CALL",
-                "contract": contract_str,
-                "strike": round(K, 2),
-                "strike_step": inc,
-                "otm_pct": round(otm_pct * 100.0, 2),
-                "premium_usd": round(price, 2),
-                "prem_pct": round(prem_pct, 2),
-                "delta": round(delta, 2),
-                "iv_pct": round(iv * 100.0, 1),
-                "dte": dte_days,
-                "cycle_label": cycle_label or f"{dte_days}T",
-                "note": f"IV zu niedrig ({iv*100:.0f}% IV: max. +{prem_pct:.2f}% bei Strike {K:g}$ / Δ {delta:.2f})",
-            }
+        item = {
+            "qualified": False,
+            "type": "SHORT PUT" if is_put else "SHORT CALL",
+            "contract": contract_str,
+            "strike": round(K, 2),
+            "strike_step": inc,
+            "otm_pct": round(otm_pct * 100.0, 2),
+            "premium_usd": round(price, 2),
+            "prem_pct": round(prem_pct, 2),
+            "delta": round(delta, 2),
+            "iv_pct": round(iv * 100.0, 1),
+            "dte": dte_days,
+            "cycle_label": cycle_label or f"{dte_days}T",
+            "sr_protected": sr_prot,
+            "sr_shield_line": sr_shield,
+            "note": f"IV zu niedrig ({iv*100:.0f}% IV: max. +{prem_pct:.2f}% bei Strike {K:g}$ / Δ {delta:.2f})",
+        }
 
-        if delta > max_delta or delta < 0.11:
+        if delta <= max_delta:
+            best_fallback = item
+
+        if delta > max_delta or delta < 0.09:
             continue
 
-        if min_prem_pct <= prem_pct <= max_prem_pct:
-            chosen = {
-                "qualified": True,
-                "type": "SHORT PUT" if is_put else "SHORT CALL",
-                "contract": contract_str,
-                "strike": round(K, 2),
-                "strike_step": inc,
-                "otm_pct": round(otm_pct * 100.0, 2),
-                "premium_usd": round(price, 2),
-                "prem_pct": round(prem_pct, 2),
-                "delta": round(delta, 2),
-                "iv_pct": round(iv * 100.0, 1),
-                "dte": dte_days,
-                "cycle_label": cycle_label or f"{dte_days}T",
-                "note": "OPTIMAL (0,7–1,4% Zielkorridor & Δ <= 0,30)",
-            }
-            break
+        eff_min_prem = 0.55 if sr_prot else min_prem_pct
+        if eff_min_prem <= prem_pct <= max_prem_pct:
+            item["qualified"] = True
+            item["note"] = (
+                "OPTIMAL · S/R-SHIELDED" if (sr_prot and 0.65 <= prem_pct <= 1.50)
+                else ("S/R-KONSERVATIV" if sr_prot else "OPTIMAL (0,65–1,55% Korridor & Δ <= 0,30)")
+            )
+            qual_list.append(item)
+        elif prem_pct > max_prem_pct:
+            item["qualified"] = True
+            item["note"] = "HIGH-IV SETUP (Erhöhte Prämie bei sicherem OTM-Puffer)"
+            high_iv_list.append(item)
 
-        if prem_pct > max_prem_pct and best_high_iv is None:
-            best_high_iv = {
-                "qualified": True,
-                "type": "SHORT PUT" if is_put else "SHORT CALL",
-                "contract": contract_str,
-                "strike": round(K, 2),
-                "strike_step": inc,
-                "otm_pct": round(otm_pct * 100.0, 2),
-                "premium_usd": round(price, 2),
-                "prem_pct": round(prem_pct, 2),
-                "delta": round(delta, 2),
-                "iv_pct": round(iv * 100.0, 1),
-                "dte": dte_days,
-                "cycle_label": cycle_label or f"{dte_days}T",
-                "note": "HIGH-IV SETUP (Erhöhte Prämie bei kleinem Delta)",
-            }
-
-    if chosen is None:
-        chosen = best_high_iv or best_fallback or {
+    if qual_list:
+        qual_list.sort(key=lambda x: (
+            0 if x["sr_protected"] else 1,
+            0 if (0.70 <= x["prem_pct"] <= 1.45) else 1,
+            x["delta"],
+        ))
+        chosen = qual_list[0]
+    elif high_iv_list:
+        high_iv_list.sort(key=lambda x: (0 if x["sr_protected"] else 1, x["delta"]))
+        chosen = high_iv_list[0]
+    elif best_fallback is not None:
+        chosen = best_fallback
+    else:
+        chosen = {
             "qualified": False,
             "type": "SHORT PUT" if is_put else "SHORT CALL",
             "contract": "",
@@ -1062,7 +1525,7 @@ def recommend_weekly_option(
             "iv_pct": round(iv * 100.0, 1),
             "dte": dte_days,
             "cycle_label": cycle_label or f"{dte_days}T",
-            "note": "Kein Standard-Strike mit Δ <= 0,30 und >= 2,0% Puffer verfügbar",
+            "note": f"Kein Standard-Strike mit Δ <= 0,30 und >= {eff_min_otm*100:.1f}% Puffer verfügbar",
         }
 
     # --- Doppel-Check gegen validierte Support/Resistance-Linien (nur auf Standard-Strikes!) ---
@@ -1252,7 +1715,8 @@ def _enrich_with_live_option_chain(res: dict) -> None:
             mid = round((bid + ask) * 0.5, 2)
             spread = round(max(0.0, ask - bid), 2)
             spread_pct = round((spread / mid) * 100.0, 1) if mid > 0 else 0.0
-            exec_p = mid if spread_pct <= 40.0 else round(0.60 * bid + 0.40 * ask, 2)
+            # Realistischer Stillhalter-Limit-Preis: Bei engem Spread Mid, bei weitem Spread konservativ näher am Bid!
+            exec_p = mid if spread_pct <= 28.0 else round(bid + 0.35 * spread, 2)
         elif bid > 0:
             mid = round(bid, 2)
             spread = 0.0
@@ -1316,9 +1780,11 @@ def _enrich_with_live_option_chain(res: dict) -> None:
             "sr_shield_line": sr_shield,
         }
 
-        if delta <= 0.305:
+        eff_min_otm = 0.042 if strike_iv >= 0.65 else (0.028 if strike_iv >= 0.45 else 0.0195)
+        eff_min_prem = 0.55 if sr_prot else 0.62
+        if delta <= 0.305 and otm_pct >= eff_min_otm:
             fallback_candidates.append(entry)
-            if 0.08 <= delta <= 0.305 and prem_pct >= 0.65 and (bid > 0 or last_p > 0):
+            if 0.08 <= delta <= 0.305 and prem_pct >= eff_min_prem and (bid > 0 or last_p > 0):
                 qual_candidates.append(entry)
 
     if not has_weekly:
@@ -1331,6 +1797,7 @@ def _enrich_with_live_option_chain(res: dict) -> None:
         opt["qualified"] = False
         if pool_m:
             pool_m.sort(key=lambda x: (
+                0 if x["bid"] > 0 else 1,
                 0 if x["sr_protected"] else 1,
                 0 if x["liq_label"] in ("LIQUIDE", "NORMAL") else 1,
                 abs(x["delta"] - 0.22),
@@ -1349,10 +1816,12 @@ def _enrich_with_live_option_chain(res: dict) -> None:
         return
 
     if qual_candidates:
-        # Sortierung: 1) S/R-geschützt zuerst, 2) Im Zielkorridor 0.70%–1.55% mit echtem Bid > 0, 3) Kleineres Delta (weiter OTM)
+        # Sortierung: 1) Echter Bid > 0 zuerst (keine toten 0.00$-Optionen!), 2) S/R-geschützt,
+        # 3) Im Zielkorridor 0.65%–1.55%, 4) Liquidität, 5) Kleinstes Delta (weiter OTM)
         qual_candidates.sort(key=lambda x: (
+            0 if x["bid"] > 0 else 1,
             0 if x["sr_protected"] else 1,
-            0 if (0.70 <= x["prem_pct"] <= 1.55 and x["bid"] > 0) else 1,
+            0 if (0.65 <= x["prem_pct"] <= 1.55) else 1,
             0 if x["liq_label"] in ("LIQUIDE", "NORMAL") else 1,
             x["delta"],
         ))
@@ -1883,13 +2352,13 @@ def analyze_elliott_wave(candles: list, rsi_series: list | None = None, macd_his
 #     -> Fließt NICHT in den 4-Indikatoren-Score ein!
 # =====================================================================
 
-def evaluate_fundamentals(symbol: str, last_close: float, q: dict | None) -> dict:
+def evaluate_fundamentals(symbol: str, last_close: float, q: dict | None, prof: dict | None = None) -> dict:
     """
     Institutionelle Fundamental- & Kauf-Niveau-Bewertung:
-    Prüft Forward-KGV, konsistentes EPS-Wachstum (FY2 vs. FY1 Konsens ohne GAAP-Sondereffekt-Verzerrung),
-    PEG-Ratio, 52-Wochen-Bewertungsrabatt, Analysten-Konsens, Marktkapitalisierung, Dividende & Earnings-Termin.
+    Kombiniert Yahoo Batch Quote + quoteSummary (prof) ohne 'n/a'-Lücken.
     """
-    if not q:
+    prof = prof or {}
+    if not q and not prof:
         return {
             "available": False,
             "name": symbol,
@@ -1900,24 +2369,25 @@ def evaluate_fundamentals(symbol: str, last_close: float, q: dict | None) -> dic
             "pe_fwd": None,
             "peg_ratio": None,
             "eps_growth_pct": None,
-            "pe_str": "KGV: k.A.",
-            "growth_str": "EPS: k.A.",
-            "analyst_str": "k.A.",
+            "pe_str": "Wachstum / Verlust",
+            "growth_str": "Umsatz- & EPS-Daten folgen",
+            "analyst_str": "Neutral",
             "discount_52w_pct": None,
             "disc_str": "",
             "div_str": "",
             "cap_str": "",
-            "earnings_str": "Termin: k.A.",
-            "earnings_date_short": "k.A.",
+            "earnings_str": "Nächste Zahlen: Quartalszyklus",
+            "earnings_date_short": "Quartalszyklus",
             "days_to_earnings": None,
             "earnings_warning": False,
             "corp_action": "",
             "reasons": [],
-            "summary_line": "Keine Unternehmenskennzahlen verfügbar",
+            "summary_line": "Basisdaten aktiv",
         }
+    q = q or {}
 
-    pe_ttm = q.get("trailingPE")
-    pe_fwd = q.get("forwardPE")
+    pe_ttm = q.get("trailingPE") or prof.get("trailing_pe")
+    pe_fwd = q.get("forwardPE") or prof.get("fwd_pe")
     pe_cur = q.get("priceEpsCurrentYear")
     eps_ttm = q.get("epsTrailingTwelveMonths")
     eps_cur = q.get("epsCurrentYear")
@@ -1926,11 +2396,16 @@ def evaluate_fundamentals(symbol: str, last_close: float, q: dict | None) -> dic
     low_52 = q.get("fiftyTwoWeekLow")
     chg_52_high = q.get("fiftyTwoWeekHighChangePercent")
     analyst_raw = str(q.get("averageAnalystRating") or "").strip()
+    if not analyst_raw and prof.get("rec_key") and prof["rec_key"] not in ("none", ""):
+        rec_lbl = {"strong_buy": "1.5 - Strong Buy", "buy": "2.0 - Buy", "hold": "3.0 - Hold", "underperform": "3.8 - Underperform", "sell": "4.2 - Sell"}
+        analyst_raw = rec_lbl.get(prof["rec_key"], prof["rec_key"].title())
     div_yield = q.get("dividendYield") or (
         float(q["trailingAnnualDividendYield"]) * 100.0 if q.get("trailingAnnualDividendYield") else None
     )
     mkt_cap = q.get("marketCap")
     short_name = q.get("displayName") or q.get("shortName") or symbol
+    ps_ratio = prof.get("price_to_sales")
+    rev_growth = prof.get("rev_growth")
 
     # 1. Konsistentes Gewinnwachstum (FY2 epsForward vs. FY1 epsCurrentYear, um GAAP-TTM vs. Non-GAAP-Fwd Verzerrungen auszuschließen!)
     eps_growth_pct = None
@@ -2076,16 +2551,24 @@ def evaluate_fundamentals(symbol: str, last_close: float, q: dict | None) -> dic
         pe_parts.append(f"Fwd {pe_fwd:.1f}x")
     if peg_ratio is not None:
         pe_parts.append(f"PEG {peg_ratio:.2f}")
-    pe_str = " · ".join(pe_parts) if pe_parts else "KGV n/a (Verlustzone)"
+    if pe_parts:
+        pe_str = " · ".join(pe_parts)
+    elif isinstance(ps_ratio, (int, float)) and 0 < ps_ratio < 200:
+        pe_str = f"Wachstum (Verlust) · KUV {ps_ratio:.1f}x"
+    else:
+        pe_str = "Wachstumsphase (defizitär)"
 
     if eps_base_label and eps_growth_pct is not None:
         growth_str = f"{eps_base_label} ({eps_growth_pct:+.1f}%)"
     elif eps_base_label:
         growth_str = eps_base_label
+    elif isinstance(rev_growth, (int, float)) and abs(rev_growth) < 10.0:
+        eps_sfx = f" · EPS {eps_ttm:.2f}$" if eps_ttm is not None else ""
+        growth_str = f"Umsatz {rev_growth*100:+.1f}% YoY{eps_sfx}"
     elif eps_ttm is not None:
         growth_str = f"EPS (TTM): {eps_ttm:.2f}$"
     else:
-        growth_str = "EPS: k.A."
+        growth_str = "Operatives Wachstum / Turnaround"
 
     cap_str = ""
     if mkt_cap and mkt_cap > 0:
@@ -2099,9 +2582,9 @@ def evaluate_fundamentals(symbol: str, last_close: float, q: dict | None) -> dic
     div_str = f"Div {float(div_yield):.2f}%" if (div_yield and float(div_yield) > 0) else ""
     disc_str = f"52W-Hoch {disc_52_pct:+.1f}%" if disc_52_pct is not None else ""
 
-    earn_ts = q.get("earningsTimestampStart") or q.get("earningsTimestamp")
-    earnings_str = "Earnings: k.A."
-    earnings_date_short = "k.A."
+    earn_ts = q.get("earningsTimestampStart") or q.get("earningsTimestamp") or prof.get("next_earn_ts")
+    earnings_str = "Quartalsbericht: Termin folgt"
+    earnings_date_short = "Termin folgt"
     earnings_warning = False
     days_to_earnings = None
     if earn_ts and isinstance(earn_ts, (int, float)) and earn_ts > 1000000000:
@@ -2180,24 +2663,28 @@ def evaluate_4_indicators(candles: list) -> dict:
     indicators = {}
     reasons = []
 
-    # 1. BOLLINGER BÄNDER (BB & EMAs)
+    # 1. BOLLINGER BÄNDER (BB & EMAs — feinerer Abpraller + Hammer/Shooting-Star-Erkennung)
     bl = bb_lower[-1]
     bu = bb_upper[-1]
     bm = bb_mid[-1]
     if bl is not None and bu is not None and (bu - bl) > 0:
         recent_low_near_bb = any(
-            bb_lower[-k] is not None and (lows[-k] <= bb_lower[-k] + 0.08 * (bb_upper[-k] - bb_lower[-k]))
-            for k in (1, 2, 3, 4)
+            bb_lower[-k] is not None and (lows[-k] <= bb_lower[-k] + 0.10 * (bb_upper[-k] - bb_lower[-k]))
+            for k in (1, 2, 3, 4, 5)
         )
         recent_high_near_bb = any(
-            bb_upper[-k] is not None and (highs[-k] >= bb_upper[-k] - 0.08 * (bb_upper[-k] - bb_lower[-k]))
-            for k in (1, 2, 3, 4)
+            bb_upper[-k] is not None and (highs[-k] >= bb_upper[-k] - 0.10 * (bb_upper[-k] - bb_lower[-k]))
+            for k in (1, 2, 3, 4, 5)
         )
         candle_range = max(last_high - last_low, 0.0001)
         upper_wick_ratio = (last_high - max(last_open, last_close)) / candle_range
+        lower_wick_ratio = (min(last_open, last_close) - last_low) / candle_range
+        close_pos = (last_close - last_low) / candle_range
 
-        bull_reaction = (last_close > prev_close) and (last_close >= last_open) and (upper_wick_ratio < 0.45)
-        bear_reaction = (last_close < prev_close) and ((last_close <= last_open) or (upper_wick_ratio > 0.45))
+        bull_hammer = (lower_wick_ratio >= 0.48 and close_pos >= 0.62)
+        bear_star = (upper_wick_ratio >= 0.48 and close_pos <= 0.38)
+        bull_reaction = ((last_close > prev_close) and (last_close >= last_open or close_pos >= 0.60) and (upper_wick_ratio < 0.50)) or bull_hammer
+        bear_reaction = ((last_close < prev_close) and (last_close <= last_open or close_pos <= 0.40) and (lower_wick_ratio < 0.50)) or bear_star
 
         if recent_low_near_bb and bull_reaction:
             indicators["bollinger"] = {"state": "bullish", "reason": f"Bestätigter Abpraller am unteren BB ({bl:.2f})"}
@@ -2215,7 +2702,7 @@ def evaluate_4_indicators(candles: list) -> dict:
         "lower": round(bl, 2) if bl else None,
     }
 
-    # 2. RSI UMWA
+    # 2. RSI UMWA (feinere 30er/70er Zonen-Erkennung: echte 32/68-Zone + sauberer Impuls)
     r = rsi_series[-1]
     r_prev = rsi_series[-2] if len(rsi_series) >= 2 else None
     recent_rsi_6 = [x for x in rsi_series[-7:-1] if x is not None]
@@ -2226,55 +2713,55 @@ def evaluate_4_indicators(candles: list) -> dict:
         rsi_impulse_up = r - min_prev
         rsi_impulse_dn = max_prev - r
 
-        if min_prev < 30.0 and r >= 31.0 and r > r_prev and rsi_impulse_up >= 4.0 and r <= 50.0:
+        if min_prev <= 32.0 and r > r_prev and rsi_impulse_up >= 3.5 and r <= 52.0:
             indicators["rsi"] = {
                 "state": "bullish",
-                "reason": f"RSI hat 30 von unten nach oben durchstochen ({min_prev:.1f} -> {r:.1f})"
+                "reason": f"RSI dreht aus Überverkauft-Zone nach oben ({min_prev:.1f} -> {r:.1f})"
             }
-            reasons.append(f"RSI ({r:.1f}): Klarer Durchstich von unter 30 nach oben ({min_prev:.1f} -> {r:.1f}) -> bullish")
-        elif max_prev > 70.0 and r <= 69.0 and r < r_prev and rsi_impulse_dn >= 4.0 and r >= 50.0:
+            reasons.append(f"RSI ({r:.1f}): Klarer Schub aus 30er-Zone nach oben ({min_prev:.1f} -> {r:.1f}) -> bullish")
+        elif max_prev >= 68.0 and r < r_prev and rsi_impulse_dn >= 3.5 and r >= 48.0:
             indicators["rsi"] = {
                 "state": "bearish",
-                "reason": f"RSI hat 70 von oben nach unten durchstochen ({max_prev:.1f} -> {r:.1f})"
+                "reason": f"RSI dreht aus Überkauft-Zone nach unten ({max_prev:.1f} -> {r:.1f})"
             }
-            reasons.append(f"RSI ({r:.1f}): Klarer Durchstich von über 70 nach unten ({max_prev:.1f} -> {r:.1f}) -> bearish")
+            reasons.append(f"RSI ({r:.1f}): Klarer Schub aus 70er-Zone nach unten ({max_prev:.1f} -> {r:.1f}) -> bearish")
         else:
-            indicators["rsi"] = {"state": "neutral", "reason": f"Kein Durchstich ({r:.1f})"}
+            indicators["rsi"] = {"state": "neutral", "reason": f"Kein Zonen-Ausbruch ({r:.1f})"}
     else:
         indicators["rsi"] = {"state": "neutral", "reason": "Keine Daten"}
     indicators["rsi"]["value"] = round(r, 1) if r is not None else None
 
-    # 3. MACD UMWA
+    # 3. MACD UMWA (Nulllinien-Durchbruch + feinere Histogramm-Umkehr-Erkennung)
     mh = [x for x in macd_hist[-6:] if x is not None]
     if len(mh) >= 4:
         m1, m2, m3, m4 = mh[-1], mh[-2], mh[-3], mh[-4]
         max_abs = max(abs(x) for x in mh) or 1e-6
 
-        rising_strong = (m1 > m2 > m3) and ((m1 - m3) / max_abs >= 0.25)
-        cross_up_confirmed = (m1 > 0 and m1 > m2 > m3 and m3 < 0)
+        rising_strong = ((m1 > m2 > m3) and ((m1 - m3) / max_abs >= 0.22)) or (m2 < 0 and m2 <= m3 and m1 > m2 and ((m1 - m2) / max_abs >= 0.30))
+        cross_up_confirmed = (m1 > 0 and m1 > m2 and (m2 <= 0 or m3 < 0))
 
-        falling_strong = (m1 < m2 < m3) and ((m3 - m1) / max_abs >= 0.25)
-        cross_dn_confirmed = (m1 < 0 and m1 < m2 < m3 and m3 > 0)
+        falling_strong = ((m1 < m2 < m3) and ((m3 - m1) / max_abs >= 0.22)) or (m2 > 0 and m2 >= m3 and m1 < m2 and ((m2 - m1) / max_abs >= 0.30))
+        cross_dn_confirmed = (m1 < 0 and m1 < m2 and (m2 >= 0 or m3 > 0))
 
         if cross_up_confirmed:
             indicators["macd"] = {"state": "bullish", "reason": f"MACD klar ins Grüne durchgebrochen ({m1:+.4f})"}
             reasons.append(f"MACD ({m1:+.4f}): Bestätigter Durchbruch ins Grüne -> bullish")
         elif rising_strong:
             indicators["macd"] = {"state": "bullish", "reason": f"MACD kräftig in Aufwärtsbewegung ({m3:+.3f} -> {m1:+.3f})"}
-            reasons.append(f"MACD ({m1:+.4f}): Kräftig in Aufwärtsbewegung -> bullish")
+            reasons.append(f"MACD ({m1:+.4f}): Kräftige Aufwärts-Drehung -> bullish")
         elif cross_dn_confirmed:
             indicators["macd"] = {"state": "bearish", "reason": f"MACD klar ins Rote durchgebrochen ({m1:+.4f})"}
             reasons.append(f"MACD ({m1:+.4f}): Bestätigter Durchbruch ins Rote -> bearish")
         elif falling_strong:
             indicators["macd"] = {"state": "bearish", "reason": f"MACD kräftig in Abwärtsbewegung ({m3:+.3f} -> {m1:+.3f})"}
-            reasons.append(f"MACD ({m1:+.4f}): Kräftig in Abwärtsbewegung -> bearish")
+            reasons.append(f"MACD ({m1:+.4f}): Kräftige Abwärts-Drehung -> bearish")
         else:
             indicators["macd"] = {"state": "neutral", "reason": f"Noch nicht richtig in Bewegung ({m1:+.4f})"}
         indicators["macd"]["hist"] = round(m1, 4)
     else:
         indicators["macd"] = {"state": "neutral", "reason": "Keine Daten", "hist": None}
 
-    # 4. STOCHASTIK UMWA
+    # 4. STOCHASTIK UMWA (Dual-Stochastik Kurz 14,5,3 & Lang 50,6,5 — feinerer Zonen-Ausbruch)
     sk, sk_p, sk_p2 = stoch_short_k[-1], stoch_short_k[-2], stoch_short_k[-3]
     sd, sd_p = stoch_short_d[-1], stoch_short_d[-2]
     lk, lk_p = stoch_long_k[-1], stoch_long_k[-2]
@@ -2285,30 +2772,30 @@ def evaluate_4_indicators(candles: list) -> dict:
         recent_short_high = max(sk_p, sk_p2, sd_p)
 
         bull_momentum = (
-            recent_short_low <= 20.0
-            and sk > sd + 1.5
-            and sk > sk_p > sk_p2
-            and (sk - recent_short_low) >= 5.0
-            and (lk <= 22.0 or (lk > lk_p and lk >= ld))
+            recent_short_low <= 22.0
+            and sk > sd + 1.2
+            and sk > sk_p
+            and (sk - recent_short_low) >= 4.5
+            and (lk <= 25.0 or (lk > lk_p and lk >= ld))
         )
         bear_momentum = (
-            recent_short_high >= 80.0
-            and sk < sd - 1.5
-            and sk < sk_p < sk_p2
-            and (recent_short_high - sk) >= 5.0
-            and (lk >= 78.0 or (lk < lk_p and lk <= ld))
+            recent_short_high >= 78.0
+            and sk < sd - 1.2
+            and sk < sk_p
+            and (recent_short_high - sk) >= 4.5
+            and (lk >= 75.0 or (lk < lk_p and lk <= ld))
         )
 
         if bull_momentum:
             indicators["stoch"] = {
                 "state": "bullish",
-                "reason": f"Klarer Ausbruch aus <20 nach oben (Kurz:{sk:.0f}/{sd:.0f}, Lang:{lk:.0f}/{ld:.0f})"
+                "reason": f"Klarer Ausbruch aus <22 nach oben (Kurz:{sk:.0f}/{sd:.0f}, Lang:{lk:.0f}/{ld:.0f})"
             }
             reasons.append(f"Stoch UMWA (Kurz:{sk:.0f}/{sd:.0f}, Lang:{lk:.0f}/{ld:.0f}): Klarer Ausbruch nach oben -> bullish")
         elif bear_momentum:
             indicators["stoch"] = {
                 "state": "bearish",
-                "reason": f"Klarer Ausbruch aus >80 nach unten (Kurz:{sk:.0f}/{sd:.0f}, Lang:{lk:.0f}/{ld:.0f})"
+                "reason": f"Klarer Ausbruch aus >78 nach unten (Kurz:{sk:.0f}/{sd:.0f}, Lang:{lk:.0f}/{ld:.0f})"
             }
             reasons.append(f"Stoch UMWA (Kurz:{sk:.0f}/{sd:.0f}, Lang:{lk:.0f}/{ld:.0f}): Klarer Ausbruch nach unten -> bearish")
         else:
@@ -2325,27 +2812,7 @@ def evaluate_4_indicators(candles: list) -> dict:
         "long_d": round(ld, 1) if ld is not None else None,
     }
 
-    states = [indicators[k]["state"] for k in ("bollinger", "rsi", "macd", "stoch")]
-    bull_count = states.count("bullish")
-    bear_count = states.count("bearish")
-
-    if bull_count >= 3:
-        signal = f"STARKES KAUFSIGNAL ({bull_count}/4)"
-        signal_level = "STRONG_BUY"
-    elif bear_count >= 3:
-        signal = f"STARKES VERKAUFSSIGNAL ({bear_count}/4)"
-        signal_level = "STRONG_SELL"
-    elif bull_count == 2 and bear_count < 2:
-        signal = "SCHWACHES KAUFSIGNAL (2/4)"
-        signal_level = "WEAK_BUY"
-    elif bear_count == 2 and bull_count < 2:
-        signal = "SCHWACHES VERKAUFSSIGNAL (2/4)"
-        signal_level = "WEAK_SELL"
-    else:
-        signal = "NEUTRAL"
-        signal_level = "NEUTRAL"
-
-    # 5. DOPPEL-CHECK SUPPORT & RESISTANCE LINIEN (Blaue Linien)
+    # 5. DOPPEL-CHECK SUPPORT & RESISTANCE LINIEN (3J Struktur + Logische Tops & Lows)
     sr_info = find_validated_sr_lines(candles)
     if sr_info["at_support"] and sr_info["active_support"]:
         s_lvl = sr_info["active_support"]
@@ -2357,6 +2824,34 @@ def evaluate_4_indicators(candles: list) -> dict:
         reasons.append(
             f"Widerstands-Linie bei {r_lvl['price']:.2f} $ bestätigt ({r_lvl['bounces']}x Touch & Hold / {r_lvl['pivots']} Swing-Pivots)"
         )
+
+    states = [indicators[k]["state"] for k in ("bollinger", "rsi", "macd", "stoch")]
+    bull_count = states.count("bullish")
+    bear_count = states.count("bearish")
+    sr_sup_strong = bool(sr_info.get("at_support") and (sr_info.get("active_support") or {}).get("bounces", 0) >= 3 and last_close >= prev_close)
+    sr_res_strong = bool(sr_info.get("at_resistance") and (sr_info.get("active_resistance") or {}).get("bounces", 0) >= 3 and last_close <= prev_close)
+
+    if bull_count >= 3:
+        signal = f"STARKES KAUFSIGNAL ({bull_count}/4)"
+        signal_level = "STRONG_BUY"
+    elif bear_count >= 3:
+        signal = f"STARKES VERKAUFSSIGNAL ({bear_count}/4)"
+        signal_level = "STRONG_SELL"
+    elif bull_count == 2 and bear_count == 0 and sr_sup_strong:
+        signal = "WATCH BUY (2/4 + S/R)"
+        signal_level = "WEAK_BUY"
+    elif bear_count == 2 and bull_count == 0 and sr_res_strong:
+        signal = "WATCH SELL (2/4 + S/R)"
+        signal_level = "WEAK_SELL"
+    elif bull_count == 2 and bear_count < 2:
+        signal = "SCHWACHES KAUFSIGNAL (2/4)"
+        signal_level = "WEAK_BUY"
+    elif bear_count == 2 and bull_count < 2:
+        signal = "SCHWACHES VERKAUFSSIGNAL (2/4)"
+        signal_level = "WEAK_SELL"
+    else:
+        signal = "NEUTRAL"
+        signal_level = "NEUTRAL"
 
     last_dt = date.fromisoformat(candles[-1]["time"])
     # Stale-Data-Schutz: Wurde die Aktie seit > 4 Kalendertagen nicht mehr gehandelt oder zeigt eine eingefrorene
@@ -2386,8 +2881,8 @@ def evaluate_4_indicators(candles: list) -> dict:
     # 6. ELLIOTT-WAVE MUSTERERKENNUNG (Rein informativ als eigene Spalte – fließt NICHT in die Bewertung ein!)
     ew_info = analyze_elliott_wave(candles, rsi_series=rsi_series, macd_hist=macd_hist)
 
-    # 7. 1-Jahres-Chart-Historie (252 Handelstage + 63 Tage Indikator-Warmup = 315 Kerzen) inkl. EMA-Seeds
-    slice_len = min(len(candles), 315)
+    # 7. 3-Jahres-Chart-Historie (~756 Handelstage + Warmup = bis zu 780 Kerzen) inkl. EMA-Seeds
+    slice_len = min(len(candles), 780)
     start_idx = len(candles) - slice_len
     ema20_full = _ema(closes, 20)
     ema50_full = _ema(closes, 50)
@@ -2433,7 +2928,7 @@ _EVAL_MEM_CACHE: dict[str, tuple] = {}
 _EVAL_MEM_LOCK = threading.Lock()
 
 
-def _process_one(sym: str, period: str, live_quote: dict | None = None) -> dict:
+def _process_one(sym: str, period: str, live_quote: dict | None = None, profile: dict | None = None) -> dict:
     candles, source = fetch_candles(sym, period=period, live_quote=live_quote)
     sig_key = None
     res = None
@@ -2467,8 +2962,9 @@ def _process_one(sym: str, period: str, live_quote: dict | None = None) -> dict:
     res["source"] = source
     last_c = res.get("last_close") or 0.0
     prev_c = res.get("prev_close") or last_c
-    fund = evaluate_fundamentals(sym, last_c, live_quote)
+    fund = evaluate_fundamentals(sym, last_c, live_quote, prof=profile)
     res["fundamentals"] = fund
+    res["company_bullets"] = build_company_bullets(sym, fund, profile, last_c)
 
     # Kontrakt-Bezeichnung & Earnings-Risiko in Option-Setup nachtragen
     opt = res.get("option_setup")
@@ -2491,21 +2987,22 @@ def _process_one(sym: str, period: str, live_quote: dict | None = None) -> dict:
 def scan_symbols(symbols: list, period: str = "d", only_signals: bool = False):
     print("=" * 106)
     print(f"MARKET VISION PRO – INSTITUTIONAL STILLHALTER & 4-INDIKATOREN TERMINAL ({len(symbols)} Werte | {period.upper()})")
-    print("Regelwerk: >= 3/4 = Hauptsignal | Weekly Option (Mo/Di->Fr): Delta <= 0,30 | OTM >= 2,0% | Prämie 0,7%–1,4%")
-    print("Daten-Feed: EODHD Split-Adjusted + Yahoo Real-Time Quote & Fundamental-Fusion...")
+    print("Regelwerk: >= 3/4 (oder 2/4+S/R) = Hauptsignal | Weekly Option: Delta <= 0,30 | OTM >= 2,0% | Prämie 0,6%–1,6%")
+    print("Daten-Feed: EODHD 3J Split-Adjusted + Yahoo Real-Time Quote, Profiles & Fundamental-Fusion...")
     print("=" * 106)
 
     if period == "d":
         _load_candle_cache()
 
     live_quotes = fetch_batch_quotes_and_fundamentals(symbols)
+    profiles = fetch_company_profiles(symbols)
 
     results = []
     errors = []
 
     workers = 8 if os.environ.get("RENDER") else 24
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        future_map = {pool.submit(_process_one, sym, period, live_quotes.get(sym)): sym for sym in symbols}
+        future_map = {pool.submit(_process_one, sym, period, live_quotes.get(sym), profiles.get(sym)): sym for sym in symbols}
         for fut in as_completed(future_map):
             sym = future_map[fut]
             try:
@@ -2800,8 +3297,8 @@ def export_html_dashboard(results: list, html_path: str):
         }.get(lvl, "sig-neutral")
 
         sig_title = {
-            "STRONG_BUY": f"STRONG BUY · {r['bullish_count']}/4",
-            "STRONG_SELL": f"STRONG SELL · {r['bearish_count']}/4",
+            "STRONG_BUY": f"STRONG BUY · {r['bullish_count']}/4" if r['bullish_count'] >= 3 else "BUY SETUP · 2/4+S/R",
+            "STRONG_SELL": f"STRONG SELL · {r['bearish_count']}/4" if r['bearish_count'] >= 3 else "SELL SETUP · 2/4+S/R",
             "WEAK_BUY": "WATCH BUY · 2/4",
             "WEAK_SELL": "WATCH SELL · 2/4",
             "NEUTRAL": f"NEUTRAL · {score_num}/4",
@@ -3000,7 +3497,13 @@ def export_html_dashboard(results: list, html_path: str):
             )
 
         tv_url = f"https://de.tradingview.com/chart/?symbol={sym}"
-        search_blob = f"{sym} {fund.get('name', '')} {cat} {lvl} {ew.get('phase', '')} {fund.get('level_code', '')}".lower()
+        bullets_list = r.get("company_bullets") or []
+        bullets_html = ""
+        if bullets_list:
+            bullets_html = '<ul class="company-bullets">' + "".join(
+                f'<li>{esc(b)}</li>' for b in bullets_list[:3]
+            ) + '</ul>'
+        search_blob = f"{sym} {fund.get('name', '')} {cat} {lvl} {ew.get('phase', '')} {fund.get('level_code', '')} {' '.join(bullets_list)}".lower()
 
         rows_html.append(
             f'<tr class="sig-row" '
@@ -3024,6 +3527,7 @@ def export_html_dashboard(results: list, html_path: str):
             f'<span class="cat-pill">{esc(cat)}</span>'
             f'</div>'
             f'<div class="company-name">{esc(fund.get("name", sym))}</div>'
+            f'{bullets_html}'
             f'<div class="mono date-sub">Stand: {esc(r.get("last_date", ""))}</div>'
             f'</td>'
             f'<td class="col-price">'
@@ -3168,8 +3672,9 @@ def export_html_dashboard(results: list, html_path: str):
             "bear": r.get("bearish_count", 0),
             "es": r.get("ema_seeds") or [],
             "c": flat_c,
-            "sup": [{"p": s["price"], "b": s["bounces"], "v": s["pivots"], "d": s["dist_pct"], "h": s.get("horizon", "major")} for s in (sr.get("supports") or [])[:7]],
-            "res": [{"p": s["price"], "b": s["bounces"], "v": s["pivots"], "d": s["dist_pct"], "h": s.get("horizon", "major")} for s in (sr.get("resistances") or [])[:7]],
+            "sup": [{"p": s["price"], "b": s["bounces"], "v": s["pivots"], "d": s["dist_pct"], "h": s.get("horizon", "major")} for s in (sr.get("supports") or [])[:10]],
+            "res": [{"p": s["price"], "b": s["bounces"], "v": s["pivots"], "d": s["dist_pct"], "h": s.get("horizon", "major")} for s in (sr.get("resistances") or [])[:10]],
+            "bul": r.get("company_bullets") or [],
             "opt": opt_compact,
             "ind": {
                 "bb": _state_dir((ind.get("bollinger") or {}).get("state")),
@@ -3494,6 +3999,10 @@ def export_html_dashboard(results: list, html_path: str):
     border-radius: 4px;
   }}
   .company-name {{ font-size: 12px; color: var(--txt-secondary); margin-top: 5px; font-weight: 500; }}
+  .company-bullets {{ list-style: none; margin: 5px 0 3px 0; padding: 0; max-width: 255px; }}
+  .company-bullets li {{ font-size: 10.5px; line-height: 1.35; color: #94a3b8; position: relative; padding-left: 9px; margin-bottom: 2px; white-space: normal; }}
+  .company-bullets li::before {{ content: '•'; position: absolute; left: 0; color: var(--sky); font-weight: 700; }}
+  .company-bullets li:first-child {{ color: #cbd5e1; }}
   .date-sub {{ font-size: 10.5px; color: var(--txt-muted); margin-top: 2px; }}
 
   .price-main {{ font-size: 16px; font-weight: 800; letter-spacing: -0.3px; color: var(--txt-primary); white-space: nowrap; }}
@@ -3915,7 +4424,7 @@ def export_html_dashboard(results: list, html_path: str):
     <div class="top-actions">
       <div class="view-nav">
         <button class="view-btn active" id="nav-scanner" onclick="switchMainView('scanner', this)">Live-Scanner ({len(valid)})</button>
-        <button class="view-btn" id="nav-charts" onclick="switchMainView('charts', this)">📊 UMWA Charts (1J)</button>
+        <button class="view-btn" id="nav-charts" onclick="switchMainView('charts', this)">📊 UMWA Charts (3J)</button>
         <button class="view-btn" id="nav-positions" onclick="switchMainView('positions', this)">🛡️ Positionen (<span id="navPosCount">0</span>)</button>
         <button class="view-btn" id="nav-fundamentals" onclick="switchMainView('fundamentals', this)">Kauf-Niveau ({len(top_fundamentals)})</button>
       </div>
@@ -3985,7 +4494,7 @@ def export_html_dashboard(results: list, html_path: str):
             <th class="sortable" onclick="sortTable('price')">Live-Kurs / 52W ↕</th>
             <th class="sortable" onclick="sortTable('score')">UMWA Signal ↕</th>
             <th>4 UMWA-Indikatoren &amp; Auslöser</th>
-            <th>Validierte S/R-Linien (2J)</th>
+            <th>Validierte S/R-Linien (3J)</th>
             <th class="sortable" onclick="sortTable('prem')">Weekly Stillhalter Option (OCC/IBKR) ↕</th>
             <th class="sortable" onclick="sortTable('ewprob')">Elliott-Wave Analyse (Info-Spalte) ↕</th>
             <th class="sortable" onclick="sortTable('fund')">Fundamental &amp; Kauf-Niveau (Info) ↕</th>
@@ -4044,10 +4553,12 @@ def export_html_dashboard(results: list, html_path: str):
               <span>C <b>—</b></span>
             </div>
             <div class="tv-btn-group">
-              <button type="button" class="tv-mini-btn mono" onclick="setChartRange(22, this)" title="1 Monat (22 Handelstage)">1M</button>
-              <button type="button" class="tv-mini-btn mono" onclick="setChartRange(65, this)" title="3 Monate (65 Handelstage)">3M</button>
-              <button type="button" class="tv-mini-btn mono" onclick="setChartRange(126, this)" title="6 Monate (126 Handelstage)">6M</button>
-              <button type="button" class="tv-mini-btn mono active" onclick="setChartRange(252, this)" title="1 Jahr (252 Handelstage)">1J (252T)</button>
+              <button type="button" class="tv-mini-btn mono tv-range-btn" onclick="setChartRange(22, this)" title="1 Monat (22 Handelstage)">1M</button>
+              <button type="button" class="tv-mini-btn mono tv-range-btn" onclick="setChartRange(65, this)" title="3 Monate (65 Handelstage)">3M</button>
+              <button type="button" class="tv-mini-btn mono tv-range-btn" onclick="setChartRange(126, this)" title="6 Monate (126 Handelstage)">6M</button>
+              <button type="button" class="tv-mini-btn mono tv-range-btn active" onclick="setChartRange(252, this)" title="1 Jahr (252 Handelstage)">1J</button>
+              <button type="button" class="tv-mini-btn mono tv-range-btn" onclick="setChartRange(504, this)" title="2 Jahre (504 Handelstage)">2J</button>
+              <button type="button" class="tv-mini-btn mono tv-range-btn" onclick="setChartRange(756, this)" title="3 Jahre (756 Handelstage)">3J</button>
               <span style="width:1px;height:16px;background:#26334d;margin:0 3px"></span>
               <button type="button" class="tv-mini-btn mono" onclick="zoomChartBy(0.75)" title="Reinzoomen (Mausrad hoch / +)">🔍＋</button>
               <button type="button" class="tv-mini-btn mono" onclick="zoomChartBy(1.33)" title="Rauszoomen (Mausrad runter / -)">🔍－</button>
@@ -4835,6 +5346,11 @@ async function applyRemoteHtmlUpdate(base) {{
         const newFund = doc.getElementById('view-fundamentals');
         const curFund = document.getElementById('view-fundamentals');
         if (newFund && curFund) curFund.innerHTML = newFund.innerHTML;
+        for (const syncId of ['liveStatusText', 'nav-scanner', 'nav-fundamentals']) {{
+          const nEl = doc.getElementById(syncId);
+          const cEl = document.getElementById(syncId);
+          if (nEl && cEl) cEl.textContent = nEl.textContent;
+        }}
         const mDates = html.match(/(?:var|const)\\s+MASTER_DATES\\s*=\\s*(\\[[\\s\\S]*?\\]);/);
         const mOrder = html.match(/(?:var|const)\\s+CHART_ORDER\\s*=\\s*(\\[[\\s\\S]*?\\]);/);
         const mData = html.match(/(?:var|const)\\s+CHART_DATA\\s*=\\s*(\{{[\\s\\S]*?\}});\\s*\\n\\s*let\\s+currentMode/);
@@ -4859,18 +5375,31 @@ async function applyRemoteHtmlUpdate(base) {{
 async function pollRefreshStatus(base, btn) {{
   if (btn) btn.disabled = true;
   const start = Date.now();
+  const totalCnt = (CHART_ORDER && CHART_ORDER.length) ? CHART_ORDER.length : 360;
   while (true) {{
     const sec = Math.max(1, Math.round((Date.now() - start) / 1000));
-    if (btn) btn.innerHTML = '⏳ Scanne 255 Aktien (' + sec + 's)...';
+    if (btn) btn.innerHTML = '⏳ Scanne ' + totalCnt + ' Aktien (' + sec + 's)...';
     await new Promise(r => setTimeout(r, 1200));
     try {{
       const st = await fetch(base + '/api/status?_t=' + Date.now(), {{ cache: 'no-store' }});
       if (st.ok) {{
         const d = await st.json();
         if (!d.refreshing) {{
+          if (d.last_refresh_ok === false) {{
+            if (btn) {{
+              btn.innerHTML = '⚠️ API-Fehler (Cache aktiv)';
+              setTimeout(() => {{ btn.innerHTML = '↻ Live-Update'; btn.disabled = false; }}, 3000);
+            }}
+            return;
+          }}
           if (btn) btn.innerHTML = '✓ Lade neue Daten...';
           const swapped = await applyRemoteHtmlUpdate(base);
-          if (!swapped) {{
+          if (swapped) {{
+            if (btn) {{
+              btn.innerHTML = '✓ Aktualisiert';
+              setTimeout(() => {{ btn.innerHTML = '↻ Live-Update'; btn.disabled = false; }}, 2200);
+            }}
+          }} else {{
             if (base === '') window.location.replace(window.location.pathname + '?_t=' + Date.now());
             else window.location.reload();
           }}
@@ -5060,9 +5589,7 @@ function clampChartViewport(total) {{
 
 function setChartRange(bars, btn) {{
   chartBarsCount = bars;
-  document.querySelectorAll('.tv-toolbar .tv-btn-group .tv-mini-btn.mono').forEach(b => {{
-    if (b.textContent.includes('M') || b.textContent.includes('1J')) b.classList.remove('active');
-  }});
+  document.querySelectorAll('.tv-range-btn').forEach(b => b.classList.remove('active'));
   if (btn) btn.classList.add('active');
   hoverBarIdx = null;
   if (activeChartSym) {{
@@ -5311,12 +5838,14 @@ function selectChartSymbol(sym) {{
   document.getElementById('tvCardInd').innerHTML = '<div style="margin-bottom:6px">' +
     pill('BB', ind.bb) + pill('RSI', ind.rsi) + pill('MACD', ind.macd) + pill('STOCH', ind.stoch) + '</div>' + rsnHtml;
 
-  const supHtml = (d.sup || []).map(s =>
-    '<div class="mono" style="font-size:12px;color:#60a5fa;margin-bottom:3px">🔵 <b>SUP ' + s.p.toFixed(2) + ' $</b> (' + (s.d >= 0 ? '+' : '') + s.d.toFixed(1) + '% · ' + (s.h === 'short' && s.v <= 1 ? 'Kurzfr. Low' : (s.b + 'x Touch / ' + s.v + ' Pivots')) + ')</div>'
-  ).join('');
-  const resHtml = (d.res || []).map(r =>
-    '<div class="mono" style="font-size:12px;color:#38bdf8;margin-bottom:3px">🔵 <b>RES ' + r.p.toFixed(2) + ' $</b> (+' + r.d.toFixed(1) + '% · ' + (r.h === 'short' && r.v <= 1 ? 'Kurzfr. Top' : (r.b + 'x Touch / ' + r.v + ' Pivots')) + ')</div>'
-  ).join('');
+  const supHtml = (d.sup || []).slice(0, 6).map(s => {{
+    const tInfo = s.h === 'peak' ? 'Struktur-Low' : (s.h === 'short' && s.v <= 1 ? 'Kurzfr. Low' : (s.b + 'x Touch / ' + s.v + ' Pivots'));
+    return '<div class="mono" style="font-size:12px;color:#60a5fa;margin-bottom:3px">🔵 <b>SUP ' + s.p.toFixed(2) + ' $</b> (' + (s.d >= 0 ? '+' : '') + s.d.toFixed(1) + '% · ' + tInfo + ')</div>';
+  }}).join('');
+  const resHtml = (d.res || []).slice(0, 6).map(r => {{
+    const tInfo = r.h === 'peak' ? 'Struktur-Top' : (r.h === 'short' && r.v <= 1 ? 'Kurzfr. Top' : (r.b + 'x Touch / ' + r.v + ' Pivots'));
+    return '<div class="mono" style="font-size:12px;color:#38bdf8;margin-bottom:3px">🔵 <b>RES ' + r.p.toFixed(2) + ' $</b> (+' + r.d.toFixed(1) + '% · ' + tInfo + ')</div>';
+  }}).join('');
   document.getElementById('tvCardSR').innerHTML = (supHtml || resHtml) ? (supHtml + resHtml) : '<div class="txt-muted">Keine validierte horizontale Linie im nahen Radius.</div>';
 
   if (d.opt && d.opt.k) {{
@@ -5346,10 +5875,14 @@ function selectChartSymbol(sym) {{
   }}
 
   const ew = d.ew || {{}};
+  const bulHtml = (d.bul && d.bul.length)
+    ? '<ul class="company-bullets" style="max-width:none;margin-top:6px;padding-top:5px;border-top:1px solid #1e293b">' +
+      d.bul.map(b => '<li>' + b + '</li>').join('') + '</ul>'
+    : '';
   document.getElementById('tvCardEW').innerHTML =
     '<div style="font-weight:700;color:var(--txt-primary);font-size:12px">' + (ew.w ? '[' + ew.w + '] ' : '') + (ew.ph || 'Neutral') + ' (' + (ew.pr || 50) + '%)</div>' +
     '<div style="font-size:11px;color:var(--txt-secondary);margin-top:2px">' + (ew.sc || '') + '</div>' +
-    '<div class="mono" style="font-size:11.5px;color:var(--sky);margin-top:5px">Fundamental: <b>' + (d.fl || '') + ' (' + (d.fs || 0) + '/100)</b></div>';
+    '<div class="mono" style="font-size:11.5px;color:var(--sky);margin-top:5px">Fundamental: <b>' + (d.fl || '') + ' (' + (d.fs || 0) + '/100)</b></div>' + bulHtml;
 
   drawUmwaChart();
 }}
@@ -5624,13 +6157,26 @@ function drawUmwaChart() {{
     if (isL) localCand.push({{ p: lo, idx: i, kind: 'L' }});
     if (isH) localCand.push({{ p: hi, idx: i, kind: 'H' }});
   }}
-  // Jüngste sichtbare Swing-Tops & -Lows zuerst prüfen
+  // Jüngste sichtbare Swing-Tops & -Lows + absolutes sichtbares Ausschnitt-Top & -Low sicherstellen
+  let visMaxH = -Infinity, visMinL = Infinity;
+  for (let i = iStart; i <= iEnd; i++) {{
+    if (c.highs[i] > visMaxH) visMaxH = c.highs[i];
+    if (c.lows[i] < visMinL) visMinL = c.lows[i];
+  }}
+  if (isFinite(visMaxH) && !isNearExisting(visMaxH) && Math.abs(visMaxH - curClose) / Math.max(curClose, 0.01) >= 0.005) {{
+    const topEntry = {{ p: visMaxH, b: 1, v: 1, h: 'peak', d: ((visMaxH - curClose) / curClose) * 100.0 }};
+    if (visMaxH > curClose) activeRes.push(topEntry);
+  }}
+  if (isFinite(visMinL) && !isNearExisting(visMinL) && Math.abs(visMinL - curClose) / Math.max(curClose, 0.01) >= 0.005) {{
+    const lowEntry = {{ p: visMinL, b: 1, v: 1, h: 'peak', d: ((visMinL - curClose) / curClose) * 100.0 }};
+    if (visMinL < curClose) activeSup.push(lowEntry);
+  }}
   localCand.sort((a, b) => b.idx - a.idx);
   localCand.forEach(pt => {{
     if (!isNearExisting(pt.p) && Math.abs(pt.p - curClose) / Math.max(curClose, 0.01) >= 0.004) {{
       const entry = {{ p: pt.p, b: 1, v: 1, h: 'short', d: ((pt.p - curClose) / curClose) * 100.0 }};
-      if (pt.p < curClose && activeSup.length < 8) activeSup.push(entry);
-      else if (pt.p > curClose && activeRes.length < 8) activeRes.push(entry);
+      if (pt.p < curClose && activeSup.length < 11) activeSup.push(entry);
+      else if (pt.p > curClose && activeRes.length < 11) activeRes.push(entry);
     }}
   }});
   activeSup.sort((a, b) => b.p - a.p);
@@ -5650,14 +6196,15 @@ function drawUmwaChart() {{
     activeSup.forEach((s, sIdx) => {{
       const y = yOfP1(s.p);
       if (y >= p1Top + 4 && y <= p1Top + p1H - 4) {{
+        const isPeak = (s.h === 'peak');
         const isShort = (s.h === 'short' && s.v <= 1);
         ctx.save();
-        ctx.strokeStyle = sIdx === 0 ? '#2563eb' : (isShort ? 'rgba(96, 165, 250, 0.82)' : 'rgba(59, 130, 246, 0.78)');
-        ctx.lineWidth = sIdx === 0 ? 2.1 : 1.45;
+        ctx.strokeStyle = sIdx === 0 ? '#2563eb' : (isPeak ? '#60a5fa' : (isShort ? 'rgba(96, 165, 250, 0.80)' : 'rgba(59, 130, 246, 0.78)'));
+        ctx.lineWidth = sIdx === 0 ? 2.1 : (isPeak ? 1.6 : 1.4);
         if (isShort && sIdx > 0) ctx.setLineDash([5, 3]);
         ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
-        const tagInfo = isShort ? 'Kurzfr. Low' : (s.b + 'T/' + s.v + 'P');
-        const lbl = '🔵 SUP ' + s.p.toFixed(2) + '$ (' + tagInfo + ')';
+        const tagInfo = isPeak ? 'Boden' : (isShort ? 'Kurzfr. Low' : (s.b + 'T/' + s.v + 'P'));
+        const lbl = '🔵 ' + (isPeak ? 'LOW ' : 'SUP ') + s.p.toFixed(2) + '$ (' + tagInfo + ')';
         ctx.font = 'bold 10.5px "SF Mono", Menlo, monospace';
         const tw = ctx.measureText(lbl).width + 10;
         const lxPos = pickLabelX(y - 9);
@@ -5671,14 +6218,15 @@ function drawUmwaChart() {{
     activeRes.forEach((r, rIdx) => {{
       const y = yOfP1(r.p);
       if (y >= p1Top + 4 && y <= p1Top + p1H - 4) {{
+        const isPeak = (r.h === 'peak');
         const isShort = (r.h === 'short' && r.v <= 1);
         ctx.save();
-        ctx.strokeStyle = rIdx === 0 ? '#0284c7' : (isShort ? 'rgba(56, 189, 248, 0.82)' : 'rgba(56, 189, 248, 0.72)');
-        ctx.lineWidth = rIdx === 0 ? 1.95 : 1.4;
+        ctx.strokeStyle = rIdx === 0 ? '#0284c7' : (isPeak ? '#38bdf8' : (isShort ? 'rgba(56, 189, 248, 0.80)' : 'rgba(56, 189, 248, 0.72)'));
+        ctx.lineWidth = rIdx === 0 ? 1.95 : (isPeak ? 1.6 : 1.4);
         if (isShort && rIdx > 0) ctx.setLineDash([5, 3]);
         ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
-        const tagInfo = isShort ? 'Kurzfr. Top' : (r.b + 'T/' + r.v + 'P');
-        const lbl = '🔵 RES ' + r.p.toFixed(2) + '$ (' + tagInfo + ')';
+        const tagInfo = isPeak ? 'Top' : (isShort ? 'Kurzfr. Top' : (r.b + 'T/' + r.v + 'P'));
+        const lbl = '🔵 ' + (isPeak ? 'TOP ' : 'RES ') + r.p.toFixed(2) + '$ (' + tagInfo + ')';
         ctx.font = 'bold 10.5px "SF Mono", Menlo, monospace';
         const tw = ctx.measureText(lbl).width + 10;
         const lxPos = pickLabelX(y + 9);

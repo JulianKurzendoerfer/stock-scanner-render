@@ -73,9 +73,10 @@ def _warmup_in_memory_cache():
 
 def _sync_to_cloud_worker():
     """
-    Hybrid-Turbo (Option 1):
-    Pusht das auf dem M1 Mac mini fertig berechnete Dashboard im Hintergrund
-    direkt zu trading-landing-page (Branch main -> https://www.market-vision-pro.com).
+    Hybrid-Turbo:
+    Pusht das auf dem M1 Mac mini fertig berechnete Dashboard inkl. frischer Caches im Hintergrund
+    sowohl zu trading-landing-page (main -> https://www.market-vision-pro.com)
+    als auch zu stock-scanner-render (version-1 -> https://version-1-umwa.onrender.com).
     """
     global LAST_CLOUD_SYNC_TS
     if IS_RENDER_CLOUD:
@@ -112,12 +113,25 @@ def _sync_to_cloud_worker():
                     ["git", "push", "origin", "main"],
                     cwd=str(landing_dir),
                     capture_output=True,
-                    timeout=45,
+                    timeout=60,
                 )
                 if push_res.returncode == 0:
                     LAST_CLOUD_SYNC_TS = int(time.time())
-        except Exception:
-            pass
+                    print(f"[{ts_str}] Cloud-Sync OK -> www.market-vision-pro.com", flush=True)
+                else:
+                    print(f"[{ts_str}] Cloud-Sync Fehler (landing): {push_res.stderr.decode(errors='ignore')[:200]}", flush=True)
+
+            # Auch das Render-Backend-Repo mit den aktuellen Caches & HTML synchronisieren
+            if (BASE_DIR / ".git").exists():
+                add_files = [f for f in ("Version_1_App.html", "Stillhalter_Dashboard.html", ".candle_cache_d.json.gz", ".fundamentals_cache.json.gz", ".profiles_cache.json.gz") if (BASE_DIR / f).exists()]
+                if add_files:
+                    subprocess.run(["git", "add"] + add_files, cwd=str(BASE_DIR), capture_output=True, timeout=20)
+                    diff_be = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(BASE_DIR), capture_output=True, timeout=10)
+                    if diff_be.returncode != 0:
+                        subprocess.run(["git", "commit", "-m", f"Auto-Sync Scan & Caches ({ts_str})"], cwd=str(BASE_DIR), capture_output=True, timeout=20)
+                        subprocess.run(["git", "push", "origin", "version-1"], cwd=str(BASE_DIR), capture_output=True, timeout=60)
+        except Exception as exc:
+            print(f"[{ts_str}] Cloud-Sync Exception: {exc}", flush=True)
 
 
 def _run_refresh_worker():
@@ -126,8 +140,23 @@ def _run_refresh_worker():
         IS_REFRESHING = True
         t0 = time.time()
         REFRESH_START_TS = int(t0)
+        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
+            # Erzwinge beim Live-Refresh einen frischen Yahoo-Crumb & frische Live-Bewertung
+            agent._get_yahoo_session_and_crumb(force_refresh=True)
             out = agent.scan_symbols(agent.DEFAULT_WATCHLIST, period="d", only_signals=True)
+            valid_items = [r for r in out if "error" not in r and r.get("signal_level") != "INACTIVE"]
+            fund_ok = sum(1 for r in valid_items if (r.get("fundamentals") or {}).get("available"))
+            min_required = max(30, int(len(valid_items) * 0.75))
+            if len(valid_items) < 50 or fund_ok < min_required:
+                print(
+                    f"[{ts_str}] QUALITÄTS-GUARD: Abbruch (nur {fund_ok}/{len(valid_items)} Fundamentaldaten OK). "
+                    f"Bestehendes Dashboard bleibt geschützt!",
+                    flush=True,
+                )
+                LAST_REFRESH_OK = False
+                return
+
             src_html = BASE_DIR / "Version_1_App.html"
             dash_html = BASE_DIR / "Stillhalter_Dashboard.html"
             agent.export_html_dashboard(out, str(dash_html))
@@ -140,9 +169,11 @@ def _run_refresh_worker():
             LAST_REFRESH_OK = True
             LAST_REFRESH_TS = int(time.time())
             LAST_DURATION_SEC = round(time.time() - t0, 2)
+            print(f"[{ts_str}] Live-Scan OK: {len(valid_items)} Aktien ({fund_ok} Fundamental OK) in {LAST_DURATION_SEC}s", flush=True)
             if not IS_RENDER_CLOUD:
                 threading.Thread(target=_sync_to_cloud_worker, daemon=True).start()
-        except Exception:
+        except Exception as exc:
+            print(f"[{ts_str}] Live-Scan Fehler: {exc}", flush=True)
             LAST_REFRESH_OK = False
         finally:
             IS_REFRESHING = False
@@ -150,26 +181,43 @@ def _run_refresh_worker():
 
 def _market_scheduler_loop():
     """
-    24/7 Hintergrund-Planer auf dem Mac mini:
-    Scannt an Handelstagen (Mo–Fr) automatisch zu den Kernzeiten (09:00, 15:35 US-Open,
-    17:30, 20:00, 22:05 US-Close) und synchronisiert das Ergebnis zu Render/GitHub.
+    24/7 Hintergrund-Planer auf dem Mac mini (Montag bis Freitag, Zeitzone Europe/Berlin):
+      1. US-Börsenöffnung: 15:35 Uhr (inkl. Nachholfenster bis 15:50 Uhr)
+      2. Abend-Update:     20:00 Uhr (inkl. Nachholfenster bis 20:15 Uhr)
+    Synchronisiert jedes erfolgreiche Update automatisch direkt auf www.market-vision-pro.com.
     """
     if IS_RENDER_CLOUD:
         return
-    schedule_slots = {"09:00", "15:35", "17:30", "20:00", "22:05"}
-    triggered_key = ""
+    try:
+        from zoneinfo import ZoneInfo
+        tz_berlin = ZoneInfo("Europe/Berlin")
+    except Exception:
+        tz_berlin = None
+
+    # (slot_name, start_minute_of_day, end_minute_of_day)
+    schedule_windows = [
+        ("us_open_1535", 15 * 60 + 35, 15 * 60 + 50),
+        ("evening_2000", 20 * 60 + 0, 20 * 60 + 15),
+    ]
+    triggered_slots: set[str] = set()
     while True:
         try:
-            now = datetime.now()
+            now = datetime.now(tz_berlin) if tz_berlin else datetime.now()
             if now.weekday() < 5:  # Mo (0) bis Fr (4)
-                hm = now.strftime("%H:%M")
-                slot_key = f"{now.strftime('%Y-%m-%d')}_{hm}"
-                if hm in schedule_slots and slot_key != triggered_key:
-                    triggered_key = slot_key
-                    trigger_async_refresh()
+                cur_min = now.hour * 60 + now.minute
+                day_str = now.strftime("%Y-%m-%d")
+                for slot_name, start_m, end_m in schedule_windows:
+                    slot_key = f"{day_str}_{slot_name}"
+                    if start_m <= cur_min <= end_m and slot_key not in triggered_slots:
+                        triggered_slots.add(slot_key)
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Auto-Scheduler startet Slot '{slot_name}'...", flush=True)
+                        trigger_async_refresh()
+                # Halte Set klein (nur heutige Einträge behalten)
+                if len(triggered_slots) > 10:
+                    triggered_slots = {k for k in triggered_slots if k.startswith(day_str)}
         except Exception:
             pass
-        time.sleep(30)
+        time.sleep(25)
 
 
 def trigger_async_refresh() -> bool:
